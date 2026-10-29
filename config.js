@@ -1,4 +1,4 @@
-import Process from './envConfig.js'
+import {Process} from './envConfig.js'
 // Все настройки в одном месте. Секреты задаются через переменные окружения (.env).
 export default {
   // 'auto' — автоматически топ монет по капитализации и объёму; или свой список: BTCUSDT,ETHUSDT

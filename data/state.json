@@ -1,8 +1,7 @@
 {
   "BTCUSDT": {
-    "action": "WATCH_SELL",
-    "at": 1793276450638,
-    "price": 80121.54
+    "action": "NEUTRAL",
+    "at": 1793290208948
   },
   "ETHUSDT": {
     "action": "WATCH_SELL",

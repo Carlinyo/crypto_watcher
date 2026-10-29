@@ -1,6 +1,6 @@
-export const process = {
+export const Process = {
     env: {
-        SYMBOLS:auto,
+        SYMBOLS: "auto",
         TOP_N:15,
         TOP_REFRESH_HOURS:24,
         EXCLUDE:'',
