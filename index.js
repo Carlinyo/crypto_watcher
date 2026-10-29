@@ -9,6 +9,7 @@
 //   node index.js --interval 15m --htf 1h --threshold 0.3
 
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -73,6 +74,7 @@ async function onWhale(ev) {
   const bigger = prev && ev.usd >= prev.usd * cfg.whales.bypassX;
   const summary = whales.summary(ev.symbol, 1);
   const line = `🐋 ${new Date(ev.time).toLocaleTimeString('ru-RU')} ${ev.side === 'buy' ? 'покупка' : 'продажа'} ${ev.symbol} ${ev.market} ${ev.type === 'series' ? `серия ×${ev.count}` : ''} ${(ev.usd / 1e6).toFixed(2)}M$`;
+  if (ev.usd < cfg.whales.notifyMinUsd) { console.log(`${line} (меньше ${cfg.whales.notifyMinUsd / 1e6}M$ — только в журнал)`); return; }
   if (prev && Date.now() - prev.at < cool && !bigger) { console.log(`${line} (уведомление недавно было — только в журнал)`); return; }
   whaleSent.set(ev.symbol, { at: Date.now(), usd: ev.usd });
   console.log(line);
@@ -127,6 +129,8 @@ async function check(symbol, name) {
     if (prev?.action !== 'NEUTRAL') { state.set(symbol, { action: 'NEUTRAL', at: Date.now() }); saveState(); }
     return;
   }
+  // уведомляем только о выбранных сигналах (по умолчанию — только ПОКУПКА), остальные видны лишь в консоли
+  if (!cfg.notify.actions.includes(r.action)) return;
   const cooldown = cfg.signal.cooldownMinutes * 60e3;
   const fresh = prev && Date.now() - prev.at < cooldown;
   if (prev?.action === r.action && fresh) return;
@@ -165,11 +169,21 @@ let running = true;
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { console.log('\nОстанавливаюсь…'); running = false; process.exit(0); });
 process.on('unhandledRejection', (e) => console.error('Необработанная ошибка:', e));
 
+// ── HTTP-порт для хостингов, которые ждут, что приложение откроет $PORT (Vercel, Render, Railway…) ──
+// Запускается до первой загрузки данных, чтобы хостинг не отключил приложение по таймауту.
+if (!once && process.env.PORT) {
+  http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: true, coins: coins.map((c) => c.symbol), uptimeSec: Math.round(process.uptime()) }));
+  }).listen(Number(process.env.PORT), () => console.log(`HTTP: слушаю порт ${process.env.PORT}`));
+}
+
 await refreshUniverse();
 if (manual && !once && cfg.whales.enabled) await whales.setSymbols(manual).catch((e) => console.error('🐋 Не удалось запустить:', e.message));
 console.log(`Слежу за: ${symbolsText()} | ТФ ${cfg.interval} (подтверждение ${cfg.higherInterval}) | порог ${cfg.signal.threshold} | опрос каждые ${cfg.pollSeconds} с`);
 console.log(`Уведомления: ${notifier.channels().join(', ')}`);
-if (cfg.whales.enabled && !once) console.log(`Киты: ${cfg.whales.markets.join(' + ')}, от ${(cfg.whales.minUsd / 1e3).toFixed(0)}K$ (порог зависит от объёма монеты)${cfg.whales.includeSells ? ', покупки и продажи' : ', только покупки'}`);
+if (cfg.whales.enabled && !once) console.log(`Киты: ${cfg.whales.markets.join(' + ')}, от ${(cfg.whales.minUsd / 1e3).toFixed(0)}K$ (порог зависит от объёма монеты)${cfg.whales.includeSells ? ', покупки и продажи' : ', только покупки'}, уведомления от ${cfg.whales.notifyMinUsd / 1e6}M$`);
+console.log(`Сигналы с уведомлением: ${cfg.notify.actions.join(', ')}`);
 if (!once) console.log('Колонки: зоны торгов | тренд | деривативы | индикаторы | паттерны | новости. Ctrl+C — выход.\n');
 
 do {

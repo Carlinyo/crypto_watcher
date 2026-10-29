@@ -72,7 +72,9 @@ export default {
     volumeShare: Number(Process.env.WHALE_VOLUME_SHARE || 0.0005), // порог = 0.05% суточного объёма монеты
     clusterMs: 100,          // сделки одного ордера приходят почти одновременно — склеиваем
     includeSells: Process.env.WHALE_SELLS === '1', // уведомлять и о крупных продажах
-    sms: Process.env.WHALE_SMS === '1',            // дублировать китовые покупки по SMS (по умолчанию — только почта)
+    // уведомлять только о китах от этой суммы; киты поменьше учитываются в анализе и пишутся в журнал
+    notifyMinUsd: Number(Process.env.WHALE_NOTIFY_MIN_USD || 30000000),
+    sms: Process.env.WHALE_SMS === '1',            // дублировать китов по SMS (работает только при SMS=1)
     cooldownMinutes: Number(Process.env.WHALE_COOLDOWN || 30), // не чаще раза в N минут по монете…
     bypassX: 2,              // …если только новый кит не крупнее прошлого в 2 раза
     series: { minutes: 10, minCount: 3, totalX: 3, partX: 0.25 }, // покупка частями: 3+ сделки по ¼ порога, в сумме ≥ 3 порогов за 10 мин
@@ -86,6 +88,9 @@ export default {
   notify: {
     console: true,
 
+    // о каких сигналах присылать уведомления: BUY, SELL, WATCH_BUY, WATCH_SELL (остальные видны только в консоли)
+    actions: (Process.env.NOTIFY_ACTIONS || 'BUY, SELL').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean),
+
     // Почта через SMTP (для Gmail нужен «пароль приложения», см. README)
     email: {
       to: Process.env.EMAIL_TO || '',
@@ -98,11 +103,12 @@ export default {
 
     // SMS через Twilio
     sms: {
+      enabled: Process.env.SMS === '1', // по умолчанию SMS выключены — все уведомления только на почту
       to: Process.env.SMS_TO || '',
       from: Process.env.TWILIO_FROM || '',
       accountSid: Process.env.TWILIO_SID || '',
       authToken: Process.env.TWILIO_TOKEN || '',
-      // SMS приходит только на сигналы ПОКУПКА / ПРОДАЖА, всё остальное — на почту
+      // при SMS=1: короткие SMS на сигналы ПОКУПКА/ПРОДАЖА из notify.actions (и на китов при WHALE_SMS=1)
     },
 
     // предупредить, если по паре столько проверок подряд закончились ошибкой

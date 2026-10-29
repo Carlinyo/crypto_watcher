@@ -4,40 +4,38 @@
     "at": 1793290208948
   },
   "ETHUSDT": {
-    "action": "WATCH_SELL",
-    "at": 1793276451693,
-    "price": 2324.46
+    "action": "NEUTRAL",
+    "at": 1793290825235
   },
   "BNBUSDT": {
     "action": "NEUTRAL",
     "at": 1793256174284
   },
   "XRPUSDT": {
-    "action": "WATCH_SELL",
-    "at": 1793256174892,
-    "price": 1.2948
+    "action": "NEUTRAL",
+    "at": 1793290827062
   },
   "SOLUSDT": {
-    "action": "WATCH_SELL",
-    "at": 1793256175750,
-    "price": 100.12
+    "action": "NEUTRAL",
+    "at": 1793290825840
   },
   "ZECUSDT": {
     "action": "NEUTRAL",
     "at": 1793256176380
   },
   "HYPEUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793256176985
+    "action": "WATCH_BUY",
+    "at": 1793290830674,
+    "price": 95.82
   },
   "TRXUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793256177575
+    "action": "WATCH_BUY",
+    "at": 1793290834748,
+    "price": 0.3315
   },
   "DOGEUSDT": {
-    "action": "WATCH_SELL",
-    "at": 1793256178408,
-    "price": 0.07827
+    "action": "NEUTRAL",
+    "at": 1793290831878
   },
   "NEARUSDT": {
     "action": "NEUTRAL",
@@ -48,22 +46,25 @@
     "at": 1793256179613
   },
   "ADAUSDT": {
-    "action": "WATCH_SELL",
-    "at": 1793256180262,
-    "price": 0.1986
+    "action": "NEUTRAL",
+    "at": 1793290835929
   },
   "LTCUSDT": {
     "action": "NEUTRAL",
     "at": 1793256181372
   },
   "SUIUSDT": {
-    "action": "WATCH_SELL",
-    "at": 1793256182452,
-    "price": 0.9112
+    "action": "NEUTRAL",
+    "at": 1793290838441
   },
   "PEPEUSDT": {
     "action": "WATCH_BUY",
     "at": 1793256183532,
     "price": 0.00000505
+  },
+  "UNIUSDT": {
+    "action": "WATCH_BUY",
+    "at": 1793290895171,
+    "price": 7.435
   }
 }
