@@ -21,8 +21,11 @@ export default {
   pollSeconds: Number(Process.env.POLL || 60), // как часто проверять цену
 
   api: {
-    spot: 'https://api.binance.com',
-    futures: 'https://fapi.binance.com',
+    // data-api.binance.vision — официальный адрес Binance только для рыночных данных.
+    // В отличие от api.binance.com, он не отвечает ошибкой 451 серверам из США (Vercel и т.п.)
+    spot: Process.env.BINANCE_SPOT_API || 'https://data-api.binance.vision',
+    // у фьючерсов такого адреса нет: из США они недоступны (451), блок деривативов тогда отключается
+    futures: Process.env.BINANCE_FUTURES_API || 'https://fapi.binance.com',
   },
 
   // Вес каждого блока анализа в итоговой оценке (сумма = 1)
@@ -78,7 +81,7 @@ export default {
     cooldownMinutes: Number(Process.env.WHALE_COOLDOWN || 30), // не чаще раза в N минут по монете…
     bypassX: 2,              // …если только новый кит не крупнее прошлого в 2 раза
     series: { minutes: 10, minCount: 3, totalX: 3, partX: 0.25 }, // покупка частями: 3+ сделки по ¼ порога, в сумме ≥ 3 порогов за 10 мин
-    spotWs: Process.env.WHALE_SPOT_WS || 'wss://stream.binance.com:9443',
+    spotWs: Process.env.WHALE_SPOT_WS || 'wss://data-stream.binance.vision', // поток только рыночных данных, доступен и из США
     futuresWs: Process.env.WHALE_FUTURES_WS || 'wss://fstream.binance.com',
   },
 
