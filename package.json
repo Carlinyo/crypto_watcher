@@ -1,0 +1,19 @@
+{
+  "name": "crypto-signal-watcher",
+  "version": "1.3.0",
+  "description": "Следит за ценой криптовалюты и уведомляет о хорошей цене для покупки или продажи",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "once": "node index.js --once",
+    "test-notify": "node index.js --test-notify"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.16"
+  },
+  "license": "MIT"
+}

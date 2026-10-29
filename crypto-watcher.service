@@ -1,0 +1,17 @@
+# systemd: запуск без Docker. Скопируйте в /etc/systemd/system/ (см. README)
+[Unit]
+Description=Crypto Signal Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/crypto-watcher
+ExecStart=/usr/bin/node index.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+User=crypto
+
+[Install]
+WantedBy=multi-user.target

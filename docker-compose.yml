@@ -1,0 +1,13 @@
+services:
+  watcher:
+    build: .
+    container_name: crypto-watcher
+    restart: unless-stopped        # перезапуск при сбое и после перезагрузки сервера
+    env_file: .env
+    volumes:
+      - ./data:/app/data           # состояние сигналов переживает перезапуск
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

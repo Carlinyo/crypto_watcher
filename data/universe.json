@@ -1,0 +1,171 @@
+{
+  "at": 1793276448213,
+  "source": "CoinGecko (капитализация + объём)",
+  "coins": [
+    {
+      "base": "BTC",
+      "symbol": "BTCUSDT",
+      "name": "Bitcoin",
+      "price": 80072,
+      "mcap": 1609533322921,
+      "volume": 27103731751,
+      "mcapRank": 1,
+      "volRank": 1,
+      "score": 1
+    },
+    {
+      "base": "ETH",
+      "symbol": "ETHUSDT",
+      "name": "Ethereum",
+      "price": 2322.38,
+      "mcap": 283671659312,
+      "volume": 10586437164,
+      "mcapRank": 2,
+      "volRank": 2,
+      "score": 2
+    },
+    {
+      "base": "BNB",
+      "symbol": "BNBUSDT",
+      "name": "BNB",
+      "price": 740.07,
+      "mcap": 97290587936,
+      "volume": 1627695429,
+      "mcapRank": 3,
+      "volRank": 5,
+      "score": 4
+    },
+    {
+      "base": "XRP",
+      "symbol": "XRPUSDT",
+      "name": "XRP",
+      "price": 1.29,
+      "mcap": 81661175670,
+      "volume": 1761796947,
+      "mcapRank": 4,
+      "volRank": 4,
+      "score": 4
+    },
+    {
+      "base": "SOL",
+      "symbol": "SOLUSDT",
+      "name": "Solana",
+      "price": 100.23,
+      "mcap": 59123020353,
+      "volume": 2776737875,
+      "mcapRank": 5,
+      "volRank": 3,
+      "score": 4
+    },
+    {
+      "base": "ZEC",
+      "symbol": "ZECUSDT",
+      "name": "Zcash",
+      "price": 1267.77,
+      "mcap": 21561359641,
+      "volume": 829653223,
+      "mcapRank": 7,
+      "volRank": 7,
+      "score": 7
+    },
+    {
+      "base": "HYPE",
+      "symbol": "HYPEUSDT",
+      "name": "Hyperliquid",
+      "price": 88.36,
+      "mcap": 21129215292,
+      "volume": 1199205690,
+      "mcapRank": 8,
+      "volRank": 6,
+      "score": 7
+    },
+    {
+      "base": "DOGE",
+      "symbol": "DOGEUSDT",
+      "name": "Dogecoin",
+      "price": 0.078588,
+      "mcap": 12294148308,
+      "volume": 451389250,
+      "mcapRank": 9,
+      "volRank": 10,
+      "score": 9.5
+    },
+    {
+      "base": "TRX",
+      "symbol": "TRXUSDT",
+      "name": "TRON",
+      "price": 0.331176,
+      "mcap": 31464507934,
+      "volume": 329864385,
+      "mcapRank": 6,
+      "volRank": 15,
+      "score": 10.5
+    },
+    {
+      "base": "NEAR",
+      "symbol": "NEARUSDT",
+      "name": "NEAR Protocol",
+      "price": 4.4,
+      "mcap": 5756465876,
+      "volume": 709746494,
+      "mcapRank": 14,
+      "volRank": 9,
+      "score": 11.5
+    },
+    {
+      "base": "ADA",
+      "symbol": "ADAUSDT",
+      "name": "Cardano",
+      "price": 0.200097,
+      "mcap": 7513232902,
+      "volume": 330935090,
+      "mcapRank": 12,
+      "volRank": 14,
+      "score": 13
+    },
+    {
+      "base": "LINK",
+      "symbol": "LINKUSDT",
+      "name": "Chainlink",
+      "price": 11.6,
+      "mcap": 8888466726,
+      "volume": 308769086,
+      "mcapRank": 11,
+      "volRank": 17,
+      "score": 14
+    },
+    {
+      "base": "LTC",
+      "symbol": "LTCUSDT",
+      "name": "Litecoin",
+      "price": 58.05,
+      "mcap": 4511517707,
+      "volume": 361679190,
+      "mcapRank": 16,
+      "volRank": 13,
+      "score": 14.5
+    },
+    {
+      "base": "SUI",
+      "symbol": "SUIUSDT",
+      "name": "Sui",
+      "price": 0.919323,
+      "mcap": 3784025830,
+      "volume": 377435834,
+      "mcapRank": 19,
+      "volRank": 12,
+      "score": 15.5
+    },
+    {
+      "base": "UNI",
+      "symbol": "UNIUSDT",
+      "name": "Uniswap",
+      "price": 7.18,
+      "mcap": 4481444275,
+      "volume": 315677042,
+      "mcapRank": 17,
+      "volRank": 16,
+      "score": 16.5
+    }
+  ]
+}
