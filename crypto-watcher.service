@@ -12,6 +12,9 @@ Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
 User=crypto
+# защита: процессу не нужны лишние права
+NoNewPrivileges=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target

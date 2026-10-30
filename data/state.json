@@ -1,70 +1,99 @@
 {
+ "signals": {
   "BTCUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793290208948
+   "action": "NEUTRAL",
+   "at": 1793290208948
   },
   "ETHUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793290825235
+   "action": "NEUTRAL",
+   "at": 1793290825235
   },
   "BNBUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793256174284
+   "action": "NEUTRAL",
+   "at": 1793256174284
   },
   "XRPUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793290827062
+   "action": "NEUTRAL",
+   "at": 1793290827062
   },
   "SOLUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793290825840
+   "action": "NEUTRAL",
+   "at": 1793290825840
   },
   "ZECUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793256176380
+   "action": "NEUTRAL",
+   "at": 1793256176380
   },
   "HYPEUSDT": {
-    "action": "WATCH_BUY",
-    "at": 1793290830674,
-    "price": 95.82
+   "action": "WATCH_BUY",
+   "at": 1793337908798,
+   "price": 93.22
   },
   "TRXUSDT": {
-    "action": "WATCH_BUY",
-    "at": 1793290834748,
-    "price": 0.3315
+   "action": "WATCH_BUY",
+   "at": 1793290834748,
+   "price": 0.3315
   },
   "DOGEUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793290831878
+   "action": "NEUTRAL",
+   "at": 1793290831878
   },
   "NEARUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793256179018
+   "action": "NEUTRAL",
+   "at": 1793256179018
   },
   "LINKUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793256179613
+   "action": "NEUTRAL",
+   "at": 1793256179613
   },
   "ADAUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793290835929
+   "action": "NEUTRAL",
+   "at": 1793290835929
   },
   "LTCUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793256181372
+   "action": "NEUTRAL",
+   "at": 1793256181372
   },
   "SUIUSDT": {
-    "action": "NEUTRAL",
-    "at": 1793290838441
+   "action": "NEUTRAL",
+   "at": 1793290838441
   },
   "PEPEUSDT": {
-    "action": "WATCH_BUY",
-    "at": 1793256183532,
-    "price": 0.00000505
+   "action": "WATCH_BUY",
+   "at": 1793256183532,
+   "price": 0.00000505
   },
   "UNIUSDT": {
-    "action": "WATCH_BUY",
-    "at": 1793290895171,
-    "price": 7.435
+   "action": "NEUTRAL",
+   "at": 1793337918834
   }
+ },
+ "pending": {},
+ "zones": {
+  "HYPEUSDT": {
+   "dir": "BUY",
+   "low": 88.02,
+   "high": 90.66332594274014,
+   "atr": 2.3134229516010008,
+   "at": 1793338147299,
+   "until": 1793424547299,
+   "lastTrigger": 0
+  }
+ },
+ "newsAlerted": {
+  "1kcjfrd": 1793337900534,
+  "1vrwhtv": 1793337900535,
+  "c0itzx": 1793337900536,
+  "8p23v0": 1793337900537,
+  "4wkztb": 1793337900537,
+  "tzz815": 1793337900538,
+  "1dew43g": 1793337900538,
+  "szd2sr": 1793337900539
+ },
+ "macroAlerted": {},
+ "digestDay": "2026-10-30",
+ "newsDay": {
+  "day": 20756,
+  "count": 8
+ }
 }

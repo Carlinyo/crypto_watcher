@@ -1,13 +1,19 @@
 {
   "name": "crypto-signal-watcher",
-  "version": "1.3.0",
-  "description": "Следит за ценой криптовалюты и уведомляет о хорошей цене для покупки или продажи",
+  "version": "2.2.0",
+  "description": "Круглосуточный анализ топ-криптовалют: уровни, тренд, деривативы, стакан, киты, паттерны, новости, макрокалендарь — уведомления о хорошей цене для покупки или продажи и автоторговля на Bybit",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "once": "node index.js --once",
-    "test-notify": "node index.js --test-notify"
+    "test-notify": "node index.js --test-notify",
+    "digest": "node index.js --digest-now",
+    "stats": "node index.js --stats",
+    "trade-check": "node index.js --trade-check",
+    "trade-status": "node index.js --trade-status",
+    "backtest": "node backtest.js --grid",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=22"

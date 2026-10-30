@@ -4,10 +4,15 @@ services:
     container_name: crypto-watcher
     restart: unless-stopped        # перезапуск при сбое и после перезагрузки сервера
     env_file: .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+    ports:
+      - "127.0.0.1:8080:8080"      # веб-панель видна только с самого сервера (заходите через SSH-туннель)
     volumes:
-      - ./data:/app/data           # состояние сигналов переживает перезапуск
+      - ./data:/app/data           # состояние, журнал сигналов и история переживают перезапуск
     logging:
       driver: json-file
       options:
-        max-size: "10m"
+        max-size: "20m"
         max-file: "3"
