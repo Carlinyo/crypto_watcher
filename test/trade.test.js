@@ -222,3 +222,115 @@ test('Bybit: режим хеджирования и команда «закры�
   assert.equal(ex.positions.size, 0);
   assert.ok(closed.every((x) => x.why === 'manual-all'));
 });
+
+test('Bybit: ручная пауза (--pause-trading) не даёт открывать сделки, --resume-trading снимает', async () => {
+  const fs = await import('node:fs'), os = await import('node:os'), path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cw-')), file = path.join(dir, 'bybit.json');
+  const { ex } = mk();
+  const c = structuredClone(cfg);
+  Object.assign(c.trade, { enabled: true, apiKey: ex.apiKey, apiSecret: ex.apiSecret });
+  const t = new Trader(c, { file, client: new Bybit({ apiKey: ex.apiKey, apiSecret: ex.apiSecret, fetchImpl: ex.fetch }), log: () => {} });
+  await t.init();
+  Trader.pause(file, 'проверка');
+  const a = await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 59000, 61500, 63000));
+  assert.equal(a.status, 'skipped');
+  assert.match(a.reason, /приостановлена.*проверка/);
+  Trader.resume(file);
+  assert.equal((await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 59000, 61500, 63000))).status, 'opened');
+  assert.ok(fs.existsSync(file), 'сделки сохранены на диск');
+});
+
+test('Bybit: ошибочные планы отклоняются — стоп у самой цены, стоп за ликвидацией, просадка за день', async () => {
+  {
+    const { t } = mk();
+    await t.init();
+    const r = await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 59950, 61500, 63000));
+    assert.equal(r.status, 'skipped');
+    assert.match(r.reason, /слишком близко/);
+  }
+  {
+    const { t } = mk({}, { leverage: 20 });
+    await t.init();
+    const r = await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 57000, 66000, 70000));
+    assert.equal(r.status, 'skipped');
+    assert.match(r.reason, /ликвидация/);
+  }
+  {
+    const { ex, t, events } = mk();
+    await t.init();
+    ex.cash = 9300; // за день счёт потерял 7% (лимит 6%)
+    const r = await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 59000, 61500, 63000));
+    assert.equal(r.status, 'skipped');
+    assert.match(r.reason, /остановлена/);
+    assert.ok(events.some((e) => e.type === 'paused'));
+  }
+});
+
+test('Bybit: позицию перевернули вручную — сделка программы закрыта, чужая позиция не трогается', async () => {
+  const { ex, t } = mk();
+  await t.init();
+  const { trade } = await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 59000, 61500, 63000));
+  const p = pos(ex, 'BTCUSDT');
+  ex.reduce(p, p.size, 60000, 0.00055);
+  ex.route('POST', '/v5/order/create', { symbol: 'BTCUSDT', side: 'Sell', orderType: 'Market', qty: '0.05' });
+  await t.tick();
+  assert.equal(trade.status, 'closed');
+  assert.equal(trade.why, 'manual');
+  assert.equal(pos(ex, 'BTCUSDT').side, 'Sell', 'ручной шорт остался');
+});
+
+test('Bybit: отменённая вручную цель выставляется снова', async () => {
+  const { ex, t, events } = mk();
+  await t.init();
+  const { trade } = await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 59000, 61500, 63000));
+  ex.orders.get(`${trade.id}-t1`).orderStatus = 'Cancelled';
+  trade.tpCheckedAt = 0;
+  await t.tick();
+  const again = ex.orders.get(`${trade.id}-t1r1`);
+  assert.ok(again && again.orderStatus === 'New' && again.price === 61500);
+  assert.equal(trade.tpIds.t1, `${trade.id}-t1r1`);
+  assert.ok(events.some((e) => e.type === 'tp-restored'));
+  await t.closeAll();
+  assert.equal([...ex.orders.values()].filter((o) => o.orderStatus === 'New').length, 0, 'при закрытии сняты и новые цели');
+});
+
+test('Bybit: реальный счёт — только с ключом, привязанным к IP; лишние права — предупреждение', async () => {
+  {
+    const { t } = mk({ ips: ['*'] }, { mode: 'live' });
+    t.mode = 'live';
+    await t.init();
+    assert.equal(t.ready, false);
+    assert.match(t.problem, /привязан к IP/);
+  }
+  {
+    const { t } = mk({ ips: ['*'] }, { mode: 'live', allowAnyIp: true });
+    t.mode = 'live';
+    await t.init();
+    assert.equal(t.ready, true, t.problem);
+  }
+  {
+    const { t } = mk({ permissions: { ContractTrade: ['Order', 'Position'], Spot: ['SpotTrade'], Wallet: [] } });
+    await t.init();
+    assert.match(t.warnings.join(' '), /лишние права \(Spot\)/);
+  }
+});
+
+test('Bybit: дневной лимит числа сделок', async () => {
+  const { t } = mk({}, { maxPerDay: 1 });
+  await t.init();
+  assert.equal((await t.onSignal(sig('BTCUSDT', 'BUY', 60000, 59000, 61500, 63000))).status, 'opened');
+  const r = await t.onSignal(sig('ETHUSDT', 'BUY', 3000, 2940, 3100, 3200));
+  assert.equal(r.status, 'skipped');
+  assert.match(r.reason, /дневной максимум/);
+});
+
+test('Bybit: при запуске находятся ордера программы без записи о сделке', async () => {
+  const { ex, t, events } = mk();
+  ex.route('POST', '/v5/order/create', { symbol: 'SOLUSDT', side: 'Buy', orderType: 'Market', qty: '10' });
+  ex.route('POST', '/v5/order/create', { symbol: 'SOLUSDT', side: 'Sell', orderType: 'Limit', qty: '10', price: '160.000', reduceOnly: true, orderLinkId: 'cwlost123ab-t1' });
+  await t.init();
+  assert.equal(t.ready, true);
+  assert.equal(t.orphans.length, 1);
+  assert.match(t.warnings.join(' '), /без записи о сделке \(SOLUSDT\)/);
+  assert.ok(events.some((e) => e.type === 'orphans'));
+});

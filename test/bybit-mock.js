@@ -161,7 +161,8 @@ export class MockBybit {
       }
       case '/v5/order/realtime': {
         if (q.orderLinkId) { const o = this.orders.get(q.orderLinkId); return ok({ category: 'linear', nextPageCursor: '', list: o ? [this.orderView(o)] : [] }); }
-        return ok({ category: 'linear', nextPageCursor: '', list: [...this.orders.values()].filter((o) => o.symbol === q.symbol && o.orderStatus === 'New').map((o) => this.orderView(o)) });
+        if (!q.symbol && !q.settleCoin) fail(10001, 'symbol, baseCoin or settleCoin is required');
+        return ok({ category: 'linear', nextPageCursor: '', list: [...this.orders.values()].filter((o) => (!q.symbol || o.symbol === q.symbol) && o.orderStatus === 'New').map((o) => this.orderView(o)) });
       }
       case '/v5/position/trading-stop': {
         const p = this.positions.get(this.posKey(q.symbol, +q.positionIdx || 0));

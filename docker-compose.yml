@@ -7,10 +7,28 @@ services:
     environment:
       - HOST=0.0.0.0
       - PORT=8080
+      - DASHBOARD_LOCAL_ONLY=1     # порт панели ниже открыт только на самом сервере
     ports:
       - "127.0.0.1:8080:8080"      # веб-панель видна только с самого сервера (заходите через SSH-туннель)
     volumes:
-      - ./data:/app/data           # состояние, журнал сигналов и история переживают перезапуск
+      - ./data:/app/data           # состояние, журнал сигналов и сделок переживают перезапуск
+    # защита контейнера: файловая система только для чтения (кроме data и /tmp), без лишних прав ядра.
+    # Права ниже нужны только при запуске — передать папку data пользователю node; сама программа работает без них.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    pids_limit: 200
+    mem_limit: 768m
     logging:
       driver: json-file
       options:

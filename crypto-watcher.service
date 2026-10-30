@@ -7,14 +7,28 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/crypto-watcher
-ExecStart=/usr/bin/node index.js
+ExecStart=/usr/bin/node --disable-proto=delete index.js
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
 User=crypto
-# защита: процессу не нужны лишние права
+UMask=0077
+# защита: процесс видит систему только для чтения, писать может лишь в папку data
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=strict
+ReadWritePaths=/opt/crypto-watcher/data
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

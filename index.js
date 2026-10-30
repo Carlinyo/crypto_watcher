@@ -10,14 +10,25 @@
 //   node index.js --trade-check       — проверить ключ Bybit, баланс и контракты
 //   node index.js --trade-status      — открытые сделки программы на Bybit и итоги
 //   node index.js --close-all         — закрыть все сделки программы на Bybit
+//   node index.js --pause-trading     — приостановить новые сделки (--resume-trading — снять паузу)
 //   флаги: --top N --threshold X --poll S --verbose --no-news --no-whales --no-server
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// на старом Node.js не загрузится .env и не будет WebSocket — лучше сразу понятная ошибка, чем тихая работа без настроек
+if (Number(process.versions.node.split('.')[0]) < 22) {
+  console.error(`⛔ Нужен Node.js 22 или новее, а установлен ${process.version}. Обновите Node.js (см. README) или запускайте через Docker.`);
+  process.exit(1);
+}
+
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const envFile = path.join(dir, '.env');
-if (fs.existsSync(envFile) && process.loadEnvFile) process.loadEnvFile(envFile);
+if (fs.existsSync(envFile) && process.loadEnvFile) {
+  process.loadEnvFile(envFile);
+  // в .env пароли и ключи: другие пользователи сервера не должны его читать
+  try { if (process.platform !== 'win32' && fs.statSync(envFile).mode & 0o077) console.error(`⚠️ Файл .env с паролями доступен другим пользователям сервера — выполните: chmod 600 ${envFile}`); } catch { /* не критично */ }
+}
 
 const { default: cfg } = await import('./config.js');
 const { Binance } = await import('./lib/binance.js');
@@ -35,10 +46,13 @@ const { selectUniverse } = await import('./lib/universe.js');
 const { startServer } = await import('./lib/server.js');
 const { MacroCalendar } = await import('./lib/calendar.js');
 const { Trader, MODE_RU } = await import('./lib/trader.js');
+const { writeJsonAtomic, readJson } = await import('./lib/storage.js');
+const { InstanceLock } = await import('./lib/lock.js');
+const { priceInZone, zoneOf, signalEmail, resultProblem, TRADE_EVENT_CATEGORY, EMAIL_EVENT_NAMES } = await import('./lib/policy.js');
 const { chartPng, chartSvg } = await import('./lib/chart.js');
 const { atr, lastValid } = await import('./lib/indicators.js');
 const { sleep } = await import('./lib/http.js');
-const { coinOf, fmt, fmtUsd, fmtMoney, trades: nTrades } = await import('./lib/format.js');
+const { coinOf, fmt, fmtUsd, fmtMoney, trades: nTrades, escapeHtml } = await import('./lib/format.js');
 const R = await import('./lib/report.js');
 
 // ── аргументы ──────────────────────────────────────────────────────────────
@@ -47,6 +61,7 @@ const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args.spl
 const bool = (n) => { const i = args.indexOf(`--${n}`); if (i < 0) return false; args.splice(i, 1); return true; };
 const once = bool('once'), verbose = bool('verbose'), testNotify = bool('test-notify'), digestNow = bool('digest-now'), showStats = bool('stats');
 const tradeCheck = bool('trade-check'), tradeStatus = bool('trade-status'), closeAll = bool('close-all');
+const pauseTrading = bool('pause-trading'), resumeTrading = bool('resume-trading');
 if (bool('no-news')) cfg.news.enabled = false;
 if (bool('no-whales')) cfg.whales.enabled = false;
 if (bool('no-server') || once) cfg.server.port = 0;
@@ -55,6 +70,18 @@ cfg.pollSeconds = Number(flag('poll') ?? cfg.pollSeconds);
 cfg.universe.size = Number(flag('top') ?? cfg.universe.size);
 const manual = args.length ? args.map((s) => s.toUpperCase())
   : cfg.symbols[0]?.toLowerCase() === 'auto' ? null : cfg.symbols.map((s) => s.toUpperCase());
+
+// ── проверка настроек: опасные значения автоторговли не применяются ──
+const { validateConfig } = await import('./lib/validate.js');
+const check = validateConfig(cfg);
+const tradeWanted = cfg.trade.enabled;
+for (const w of check.warnings) console.error(`⚠️ Настройки: ${w}`);
+if (check.dashboard) console.error(`⚠️ ${check.dashboard}`);
+if (check.tradeErrors.length) {
+  console.error(`⛔ Ошибки в настройках автоторговли:\n  • ${check.tradeErrors.join('\n  • ')}`);
+  if (cfg.trade.enabled) console.error('⛔ Новые сделки выключены до исправления .env (открытые сделки по-прежнему сопровождаются)');
+  cfg.trade.enabled = false;
+}
 
 // ── компоненты ─────────────────────────────────────────────────────────────
 const file = (f) => path.resolve(dir, f);
@@ -84,9 +111,25 @@ if (showStats) {
   process.exit(0);
 }
 
+// ── пауза автоторговли без остановки программы ─────────────────────────────
+if (pauseTrading || resumeTrading) {
+  const f = file(cfg.files.trades);
+  if (pauseTrading) {
+    Trader.pause(f, `команда --pause-trading, ${new Date().toLocaleString('ru-RU')}`);
+    console.log('⏸ Автоторговля приостановлена: новые сделки не открываются, открытые сопровождаются как обычно.\n   Снять паузу: node index.js --resume-trading');
+  } else {
+    Trader.resume(f);
+    console.log('▶️ Пауза снята — новые сделки снова открываются (если в .env TRADE=1).');
+  }
+  process.exit(0);
+}
+
 // ── команды автоторговли ───────────────────────────────────────────────────
 if (tradeCheck || tradeStatus || closeAll) {
   console.log(`Bybit: ${MODE_RU[trader.mode]} — ${trader.client.base}`);
+  for (const er of check.tradeErrors) console.log(`⛔ Ошибка в .env: ${er}`);
+  const up = trader.userPause();
+  if (up) console.log(`⏸ Автоторговля на паузе с ${new Date(up.at).toLocaleString('ru-RU')} (${up.reason}) — снять: --resume-trading`);
   if (!trader.hasKeys()) { console.log('❌ Не заданы BYBIT_API_KEY и BYBIT_API_SECRET в .env'); process.exit(1); }
   await trader.init();
   if (!trader.ready) { console.log(`❌ ${trader.problem}`); process.exit(1); }
@@ -121,7 +164,7 @@ if (tradeCheck || tradeStatus || closeAll) {
 // ── состояние (переживает перезапуск) ──────────────────────────────────────
 const stateFile = file(cfg.files.state);
 let state = { signals: {}, pending: {}, zones: {}, newsAlerted: {}, macroAlerted: {}, digestDay: null, newsDay: { day: 0, count: 0 } };
-try { state = { ...state, ...JSON.parse(fs.readFileSync(stateFile, 'utf8')) }; } catch { /* первый запуск */ }
+state = { ...state, ...(readJson(stateFile, {}) ?? {}) };
 // совместимость с версией 1.x: там состояние хранилось как { BTCUSDT: {action, at} }
 for (const [k, v] of Object.entries(state)) if (/USDT$/.test(k) && v?.action) { state.signals[k] = v; delete state[k]; }
 let saveTimer = null;
@@ -129,7 +172,7 @@ function saveState() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    try { fs.mkdirSync(path.dirname(stateFile), { recursive: true }); fs.writeFileSync(stateFile, JSON.stringify(state, null, 1)); }
+    try { writeJsonAtomic(stateFile, state, { pretty: true }); }
     catch (e) { console.error('Не удалось сохранить состояние:', e.message); }
   }, 500);
 }
@@ -144,7 +187,9 @@ let universeAt = 0;
 let lastCycleAt = 0, cycles = 0;
 const startedAt = Date.now();
 
-function logAlert(subject) { alertLog.unshift({ t: Date.now(), subject }); alertLog.length = Math.min(alertLog.length, 100); }
+// о чём писать на почту — EMAIL_EVENTS (по умолчанию: цена в зоне входа, сделки, киты, сбои); остальное — в панели
+const wants = (cat) => cfg.notify.events.includes(cat);
+function logAlert(subject, sent = true) { alertLog.unshift({ t: Date.now(), subject, sent }); alertLog.length = Math.min(alertLog.length, 150); }
 
 // ── список монет ───────────────────────────────────────────────────────────
 async function refreshUniverse(force = false) {
@@ -166,13 +211,13 @@ async function refreshUniverse(force = false) {
   console.log(`\nМонеты (${source}):\n${R.coinsTable(coins)}\n`);
   if (once) return;
   if (first) {
-    const m = R.startMessage({ coins, source, cfg, channels: notifier.channels(), trading: trader.describe() });
-    logAlert(m.subject);
-    await notifier.broadcast(m);
+    const m = R.startMessage({ coins, source, cfg, channels: notifier.channels(), trading: trader.describe(), events: cfg.notify.events.map((x) => EMAIL_EVENT_NAMES[x] ?? x) });
+    logAlert(m.subject, wants('start'));
+    if (wants('start')) await notifier.broadcast(m);
   } else if (added.length || removed.length) {
     const m = R.startMessage({ coins, source, cfg, channels: notifier.channels(), changed: { added, removed } });
-    logAlert(m.subject);
-    notifier.enqueue({ ...m, tag: '🔄' });
+    logAlert(m.subject, wants('start'));
+    if (wants('start')) notifier.enqueue({ ...m, tag: '🔄' });
   }
 }
 
@@ -275,8 +320,9 @@ function chartFor(r) {
 // ── сигналы ────────────────────────────────────────────────────────────────
 function notifyJournal(ev) {
   const m = R.journalMessage(ev, journal.stats(30));
-  logAlert(m.subject);
-  notifier.enqueue({ ...m, tag: m.subject.split(' ')[0] });
+  logAlert(m.subject, wants('journal'));
+  if (wants('journal')) notifier.enqueue({ ...m, tag: m.subject.split(' ')[0] });
+  else console.log(`📒 ${m.subject}`);
 }
 
 // анализ развернулся против открытого сигнала — предупредить один раз
@@ -287,13 +333,17 @@ function checkReversal(r) {
   if (!against || r.action === (en.side === 'BUY' ? 'SELL' : 'BUY')) return; // сильный обратный сигнал закроет сделку сам
   en.reversalWarned = Date.now();
   journal.save();
+  const m = R.reversalMessage(en, r, {});
+  logAlert(m.subject, wants('reversal'));
+  if (!wants('reversal')) { console.log(m.subject); return; }
   const ch = chartFor(r);
-  const m = R.reversalMessage(en, r, { chartCid: ch.chartCid });
-  logAlert(m.subject);
-  notifier.enqueue({ ...m, tag: '⚠️', attachments: ch.attachments });
+  notifier.enqueue({ ...R.reversalMessage(en, r, { chartCid: ch.chartCid }), tag: '⚠️', attachments: ch.attachments });
 }
 
 async function handleResult(r, { zone = false } = {}) {
+  // результат с нечисловыми значениями или перепутанными стопом и целями — не основание для письма и сделки
+  const bad = resultProblem(r);
+  if (bad) { console.error(`${r.symbol}: результат анализа отклонён — ${bad}`); onError(r.symbol, new Error(`результат анализа отклонён: ${bad}`)); return; }
   results.set(r.symbol, r);
   if (once) return;
   checkReversal(r);
@@ -318,21 +368,36 @@ async function handleResult(r, { zone = false } = {}) {
 
   if (strong) {
     const fresh = st && now - st.at < cfg.signal.cooldownMinutes * 60e3;
-    if (st?.action === r.action && fresh) return;
+    // тот же сигнал недавно уже был: пропускаем, если о нём уже написали (или это не вход цены в зону)
+    if (st?.action === r.action && fresh && (st.notified !== false || !zone)) return;
+    // по монете уже открыта сделка в эту сторону — повторный сигнал ничего не добавит
+    if (hasTrade(sym, r.action)) { delete state.zones[sym]; return; }
+    const inZone = zone || priceInZone(zoneOf(r), r.price);
+    delete state.pending[sym];
+    // автоторговля: по умолчанию — когда цена в зоне входа (TRADE_ENTRY=zone), иначе сразу по сигналу
+    const tradeNow = trader.enabled && (cfg.trade.entry === 'signal' || inZone);
+    r.exec = tradeNow ? await trader.onSignal(r, { zone }) : null;
+    if (r.exec) console.log(`🤖 Bybit: ${r.exec.status === 'opened' ? `открыт ${r.exec.trade.side === 'Buy' ? 'лонг' : 'шорт'} ${coinOf(sym)} на ${fmtMoney(r.exec.trade.notional)}` : `без сделки — ${r.exec.reason}`}`);
+    const opened = r.exec?.status === 'opened';
+    const send = signalEmail(cfg.notify.events, { inZone, opened });
+    state.signals[sym] = { action: r.action, at: now, price: r.price, notified: send };
+    if (!send && !opened) {
+      // цена ещё не в зоне входа — ждём её; письмо, SMS и сделка — когда цена войдёт в зону
+      if (!inZone) armZone(r);
+      saveState();
+      logAlert(`${R.signalSubject(r)} — жду цену в зоне ${fmt(r.plan.zone[0])}–${fmt(r.plan.zone[1])}`, false);
+      console.log(`⏳ ${coinOf(sym)}: ${r.action === 'BUY' ? 'покупка' : 'продажа'}, но цена ${fmt(r.price)} ещё не в зоне ${fmt(r.plan.zone[0])}–${fmt(r.plan.zone[1])} — письмо придёт, когда войдёт`);
+      return;
+    }
     r.exposure = journal.entries.filter((x) => x.status === 'open' && x.symbol !== sym && x.side === r.action).map((x) => ({ symbol: x.symbol, opened: x.opened }));
     const { events } = journal.open(r);
     for (const ev of events) notifyJournal(ev);
-    // «готовиться» по этой монете, ещё ждущее в очереди писем, устарело — сигнал важнее
-    notifier.drop(`watch:${sym}`);
-    state.signals[sym] = { action: r.action, at: now, price: r.price };
+    notifier.drop(`watch:${sym}`); // «готовиться» по этой монете, ещё ждущее в очереди писем, устарело
     delete state.zones[sym];
-    delete state.pending[sym];
     saveState();
-    // автоторговля: сначала сделка на Bybit, потом письмо и SMS — уже с её результатом
-    r.exec = trader.enabled ? await trader.onSignal(r, { zone }) : null;
-    if (r.exec) console.log(`🤖 Bybit: ${r.exec.status === 'opened' ? `открыт ${r.exec.trade.side === 'Buy' ? 'лонг' : 'шорт'} ${coinOf(sym)} на ${fmtMoney(r.exec.trade.notional)}` : `без сделки — ${r.exec.reason}`}`);
     const subject = R.signalSubject(r, { zone });
-    logAlert(subject);
+    logAlert(subject, send);
+    if (!send) return; // сделка открыта, но письма о сделках выключены (EMAIL_EVENTS без trade и zone)
     const ch = chartFor(r);
     await notifier.urgent({ subject, text: R.signalText(r, { zone }), html: R.signalHtml(r, { zone, chartCid: ch.chartCid }), smsText: R.smsText(r, { zone }), attachments: ch.attachments });
     return;
@@ -341,16 +406,27 @@ async function handleResult(r, { zone = false } = {}) {
   // «готовиться»: запоминаем зону — как только цена в неё войдёт, анализ запустится сразу.
   // Если даже от зоны прибыль/риск плохой — точки входа нет, письмо не нужно (видно в панели).
   if (!r.zoneOk) { delete state.zones[sym]; saveState(); return; }
-  const prevZone = state.zones[sym];
-  state.zones[sym] = { dir: r.plan.dir, low: r.plan.zone[0], high: r.plan.zone[1], atr: r.stats.atr, at: now, until: now + cfg.signal.zoneValidHours * 3600e3, lastTrigger: prevZone?.lastTrigger ?? 0 };
   const base = r.action.replace('WATCH_', '');
+  // в эту сторону по монете уже действуем (сигнал только что был или сделка открыта) — новую зону не ждём
+  if ((st?.action === base && st.notified !== false && now - st.at < cfg.signal.cooldownMinutes * 60e3) || hasTrade(sym, base)) return;
+  armZone(r);
   if (st && (st.action === r.action || st.action === base) && now - st.at < cfg.signal.watchCooldownMinutes * 60e3) { saveState(); return; }
   const subject = R.signalSubject(r);
-  logAlert(subject);
-  const ch = chartFor(r);
-  notifier.enqueue({ subject, text: R.signalText(r), html: R.signalHtml(r, { chartCid: ch.chartCid }), tag: '🟡', attachments: ch.attachments, key: `watch:${sym}` });
-  state.signals[sym] = { action: r.action, at: now, price: r.price };
+  logAlert(subject, wants('watch'));
+  if (wants('watch')) {
+    const ch = chartFor(r);
+    notifier.enqueue({ subject, text: R.signalText(r), html: R.signalHtml(r, { chartCid: ch.chartCid }), tag: '🟡', attachments: ch.attachments, key: `watch:${sym}` });
+  } else console.log(`⏳ ${subject}`);
+  state.signals[sym] = { action: r.action, at: now, price: r.price, notified: wants('watch') };
   saveState();
+}
+
+const hasTrade = (sym, dir) => trader.openTrades().some((t) => t.symbol === sym && (t.side === 'Buy') === (dir === 'BUY'));
+
+// зона входа, которую ждём: как только цена в неё войдёт — анализ сразу, письмо и сделка
+function armZone(r) {
+  const prev = state.zones[r.symbol];
+  state.zones[r.symbol] = { dir: r.plan.dir, low: r.plan.zone[0], high: r.plan.zone[1], atr: r.stats.atr, at: Date.now(), until: Date.now() + cfg.signal.zoneValidHours * 3600e3, lastTrigger: prev?.lastTrigger ?? 0, stop: r.plan.stop, t1: r.plan.t1 };
 }
 
 function newsAlerts(r) {
@@ -362,8 +438,8 @@ function newsAlerts(r) {
     state.newsAlerted[a.id] = Date.now();
     state.newsDay.count++;
     const m = R.newsMessage(r.symbol, a, r);
-    logAlert(m.subject);
-    notifier.enqueue({ ...m, tag: '📰' });
+    logAlert(m.subject, wants('news'));
+    if (wants('news')) notifier.enqueue({ ...m, tag: '📰' });
   }
   for (const [id, t] of Object.entries(state.newsAlerted)) if (Date.now() - t > 4 * 86400e3) delete state.newsAlerted[id];
   saveState();
@@ -379,8 +455,8 @@ function macroAlerts() {
     state.macroAlerted[ev.id] = now;
     const btc = results.get('BTCUSDT') ?? results.get('BTCUSDT@ctx');
     const m = R.macroMessage(ev, { btc: btc ? { price: btc.price, score: btc.score, change24h: btc.stats?.change24h } : null, open: journal.entries.filter((x) => x.status === 'open'), filter: cfg.macro.filter !== false });
-    logAlert(m.subject);
-    notifier.enqueue({ ...m, tag: '📅' });
+    logAlert(m.subject, wants('macro'));
+    if (wants('macro')) notifier.enqueue({ ...m, tag: '📅' });
   }
   for (const [id, t] of Object.entries(state.macroAlerted)) if (now - t > 30 * 86400e3) delete state.macroAlerted[id];
   saveState();
@@ -389,9 +465,10 @@ function macroAlerts() {
 // ── автоторговля: письма о сопровождении сделок ─────────────────────────────
 function onTradeEvent(ev) {
   const m = R.tradeEventMessage(ev, { pnlToday: trader.state.pnlToday, stats: trader.stats(30), balance: trader.balance });
+  const send = wants(TRADE_EVENT_CATEGORY[ev.type] ?? 'trade');
   console.log(m.subject);
-  logAlert(m.subject);
-  notifier.enqueue({ ...m, tag: '🤖' });
+  logAlert(m.subject, send);
+  if (send) notifier.enqueue({ ...m, tag: '🤖' });
 }
 
 // ── киты ───────────────────────────────────────────────────────────────────
@@ -403,8 +480,10 @@ async function onWhale(ev, decision) {
   if (!decision.alert) { if (verbose) console.log(`${line} — без письма: ${decision.reason}`); return; }
   console.log(line);
   const ch = chartFor(results.get(ev.symbol));
-  const m = R.whaleMessage(ev, decision, { summary: flow.summary(ev.symbol, 60), result: results.get(ev.symbol), chartCid: ch.chartCid });
-  logAlert(m.subject);
+  const trade = trader.openTrades().find((t) => t.symbol === ev.symbol) ?? null;
+  const m = R.whaleMessage(ev, decision, { summary: flow.summary(ev.symbol, 60), result: results.get(ev.symbol), chartCid: ch.chartCid, trade, zone: state.zones[ev.symbol] ?? null });
+  logAlert(m.subject, wants('whales'));
+  if (!wants('whales')) return;
   notifier.enqueue({ subject: m.subject, text: m.text, html: m.html, tag: '🐋', attachments: ch.attachments });
   if (cfg.whales.sms) notifier.sms(m.sms);
 }
@@ -433,13 +512,24 @@ function liveTick() {
   const now = Date.now();
   for (const [sym, z] of Object.entries(state.zones)) {
     if (now > z.until) { delete state.zones[sym]; saveState(); continue; }
-    const lp = flow.lastPrice(sym);
-    if (!lp || now - lp.time > 60e3 || triggering.has(sym) || now - (z.lastTrigger || 0) < 10 * 60e3) continue;
-    const inZone = z.dir === 'BUY'
-      ? lp.price <= z.high + 0.05 * z.atr && lp.price >= z.low - 0.4 * z.atr
-      : lp.price >= z.low - 0.05 * z.atr && lp.price <= z.high + 0.4 * z.atr;
-    if (!inZone) continue;
+    const rr = results.get(sym);
+    const lp = flow.lastPrice(sym) ?? (rr ? { price: rr.price, time: rr.time } : null);
+    const maxAge = streamsOn ? 60e3 : cfg.pollSeconds * 3000;
+    if (!lp || now - lp.time > maxAge || triggering.has(sym)) continue;
+    // цена прошла сквозь зону за стоп — зона пробита, ждать её больше нечего
+    if (z.stop && (z.dir === 'BUY' ? lp.price < z.stop : lp.price > z.stop)) {
+      console.log(`⏹ ${coinOf(sym)}: цена ${fmt(lp.price)} ушла за стоп ${fmt(z.stop)} — зона ${fmt(z.low)}–${fmt(z.high)} больше не актуальна`);
+      delete state.zones[sym];
+      saveState();
+      continue;
+    }
+    if (!priceInZone(z, lp.price)) continue;
+    // повторная проверка — через 10 минут, или раньше, если цена зашла глубже в зону (вход стал выгоднее)
+    const deeper = z.lastTriggerPrice && (z.dir === 'BUY' ? lp.price <= z.lastTriggerPrice - 0.25 * z.atr : lp.price >= z.lastTriggerPrice + 0.25 * z.atr);
+    const since = now - (z.lastTrigger || 0);
+    if (since < 10 * 60e3 && !(deeper && since > 30e3)) continue;
     z.lastTrigger = now;
+    z.lastTriggerPrice = lp.price;
     triggering.add(sym);
     zoneTrigger(sym, z).catch((e) => console.error(`🎯 ${sym}: ${e.message}`)).finally(() => triggering.delete(sym));
   }
@@ -473,8 +563,8 @@ function checkMove(c) {
     try { r = analyze(await gather(c), cfg); await handleResult(r); } catch (e) { console.error(`⚡ ${sym}: ${e.message}`); }
     const ch = chartFor(r);
     const m = R.moveMessage(mv, r, { liq: streamsOn ? liq.summary(sym, 15) : null, flow: streamsOn ? flow.summary(sym, 15) : null, chartCid: ch.chartCid });
-    logAlert(m.subject);
-    notifier.enqueue({ ...m, tag: '⚡', attachments: ch.attachments });
+    logAlert(m.subject, wants('moves'));
+    if (wants('moves')) notifier.enqueue({ ...m, tag: '⚡', attachments: ch.attachments });
   })().finally(() => moving.delete(sym));
 }
 
@@ -511,7 +601,7 @@ async function sendDigest() {
 }
 
 function digestDue() {
-  if (!cfg.digest.enabled) return false;
+  if (!cfg.digest.enabled || !wants('digest')) return false;
   const d = new Date();
   return d.getHours() >= cfg.digest.hour && state.digestDay !== d.toLocaleDateString('sv-SE');
 }
@@ -558,6 +648,8 @@ const app = {
     news: [...results.values()].flatMap((r) => r.news?.top ?? []).filter((n, i, a) => a.findIndex((x) => x.title === n.title) === i).sort((a, b) => b.time - a.time).slice(0, 12),
     whales4h: streamsOn ? Object.fromEntries(coins.map((c) => [c.symbol, flow.summary(c.symbol, 240)?.whales]).filter(([, w]) => w)) : {},
     trading: trader.enabled || trader.openTrades().length ? trader.status() : null,
+    zones: Object.entries(state.zones).map(([symbol, z]) => ({ symbol, ...z, price: flow.lastPrice(symbol)?.price ?? results.get(symbol)?.price ?? null })),
+    emailEvents: cfg.notify.events.map((x) => EMAIL_EVENT_NAMES[x] ?? x),
   }),
 };
 
@@ -580,8 +672,8 @@ function reportErrors() {
       restrictedAlerted = true;
       const subject = '⚠️ Crypto Watcher: Binance недоступен с этого сервера';
       const text = `Binance отвечает, что доступ из страны сервера ограничен:\n${binance.restricted}\n\nПеренесите сервер в другую страну (например, Германию или Финляндию) — иначе анализ работать не будет.`;
-      logAlert(subject);
-      notifier.enqueue({ subject, tag: '⚠️', text, html: `<p><b>${subject}</b></p><p>${text.replace(/\n/g, '<br>')}</p>` });
+      logAlert(subject, wants('critical'));
+      if (wants('critical')) notifier.enqueue({ subject, tag: '⚠️', text, html: `<p><b>${subject}</b></p><p>${text.replace(/\n/g, '<br>')}</p>` });
     }
     return;
   }
@@ -591,13 +683,13 @@ function reportErrors() {
   const subject = `⚠️ Crypto Watcher: нет данных по ${fresh.length === 1 ? fresh[0] : `${fresh.length} монетам`}`;
   const lines = fresh.map((s) => `${s}: ${lastErrors.get(s)}`);
   const text = `${cfg.notify.errorAlertAfter}+ проверок подряд завершились ошибкой:\n${lines.join('\n')}\n\nПрограмма продолжает попытки и сама продолжит анализ, когда данные появятся.`;
-  logAlert(subject);
-  notifier.enqueue({ subject, tag: '⚠️', text, html: `<p><b>${subject}</b></p><p>${text.replace(/\n/g, '<br>')}</p>` });
+  logAlert(subject, wants('critical'));
+  if (wants('critical')) notifier.enqueue({ subject, tag: '⚠️', text, html: `<p><b>${subject}</b></p><p>${text.replace(/\n/g, '<br>')}</p>` });
 }
 
 // ── тест уведомлений ───────────────────────────────────────────────────────
 if (testNotify) {
-  console.log(`Отправляю тест в каналы: ${notifier.channels().join(', ')}`);
+  console.log(`Отправляю тест в каналы: ${notifier.channels({ masked: true }).join(', ')}`);
   if (!notifier.emailReady()) console.log('⚠️ Почта не настроена: заполните EMAIL_TO, SMTP_USER и SMTP_PASS в .env');
   if (!notifier.smsReady()) console.log('ℹ️ SMS не настроены: TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, SMS_TO');
   const what = manual ? manual.join(', ') : `автоматически топ-${cfg.universe.size}`;
@@ -613,27 +705,68 @@ if (testNotify) {
 
 // ── запуск ─────────────────────────────────────────────────────────────────
 let running = true;
+const lock = new InstanceLock(file('data/instance.lock'));
+function saveAll() {
+  try { writeJsonAtomic(stateFile, state, { pretty: true }); } catch { /* ignore */ }
+  try { journal.save(); } catch { /* ignore */ }
+  try { trader.save(); } catch { /* ignore */ }
+}
 async function shutdown() {
   if (!running) return;
   running = false;
   console.log('\nОстанавливаюсь…');
   spotStream.stop(); futStream.stop(); flow.stop();
-  try { fs.mkdirSync(path.dirname(stateFile), { recursive: true }); fs.writeFileSync(stateFile, JSON.stringify(state, null, 1)); } catch { /* ignore */ }
-  journal.save();
-  trader.save();
+  // операция с биржей (вход, перенос стопа) не должна оборваться на середине
+  await Promise.race([trader.queue, sleep(15e3)]);
+  saveAll();
   await Promise.race([notifier.flush(), sleep(10e3)]);
+  lock.release();
   process.exit(0);
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('unhandledRejection', (e) => console.error('Необработанная ошибка:', e));
+process.on('uncaughtException', (e) => {
+  console.error('Критическая ошибка — сохраняю состояние и перезапускаюсь:', e);
+  saveAll();
+  process.exit(1);
+});
+
+// две копии программы открыли бы каждую сделку дважды — вторая ждёт, пока первая не остановится
+if (!once) {
+  let res = lock.tryAcquire(), told = 0;
+  while (!res.ok) {
+    if (Date.now() - told > 5 * 60e3) {
+      told = Date.now();
+      console.error(`⚠️ Уже работает другая копия программы (${res.holder.host}, pid ${res.holder.pid}, запущена ${new Date(res.holder.startedAt).toLocaleString('ru-RU')}). Жду, пока она остановится…`);
+    }
+    await sleep(15e3);
+    res = lock.tryAcquire();
+  }
+}
 
 if (!BinanceStream.supported() && cfg.whales.enabled && !once) console.error('⚠️ Для китов, ликвидаций и живых зон нужен Node.js 22+ (WebSocket) — эти функции отключены');
+// часы сервера: если они сильно врут, свечи считаются «устаревшими», а время сделок — неверным
+const clockSkew = once ? null : await binance.serverTimeSkew().catch(() => null);
+if (clockSkew != null && Math.abs(clockSkew) > 5e3) console.error(`⚠️ Часы сервера расходятся с Binance на ${(clockSkew / 1000).toFixed(1)} с — включите синхронизацию времени: timedatectl set-ntp true`);
 await market.refresh();
 const tradingOn = !once && (trader.enabled || trader.openTrades().length > 0);
+const critical = (subject, text) => {
+  logAlert(subject, wants('critical'));
+  if (wants('critical')) notifier.enqueue({ subject, tag: '⚠️', text, html: `<p><b>${escapeHtml(subject)}</b></p><p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>` });
+};
+if (clockSkew != null && Math.abs(clockSkew) > 60e3) critical('⚠️ Crypto Watcher: часы сервера врут', `Время сервера расходится с Binance на ${Math.round(clockSkew / 1000)} с. Из-за этого данные могут считаться устаревшими, а сделки — открываться с ошибками. Включите синхронизацию времени: timedatectl set-ntp true`);
+if (!once && tradeWanted && check.tradeErrors.length) {
+  critical('⚠️ Crypto Watcher: автоторговля выключена — ошибки в настройках', `В .env неверные значения:\n• ${check.tradeErrors.join('\n• ')}\n\nНовые сделки не открываются, пока вы не исправите .env и не перезапустите программу. Открытые сделки сопровождаются как обычно.`);
+}
 if (tradingOn) {
   await trader.init();
   console.log(trader.describe());
+  if (trader.ready && trader.enabled && trader.mode === 'live') {
+    const c = cfg.trade;
+    critical('⚠️ Crypto Watcher: автоторговля на РЕАЛЬНОМ счёте Bybit включена', `Баланс ${fmtMoney(trader.balance?.equity)}. Риск ${c.riskPct}% на сделку, плечо до ×${c.leverage}, до ${c.maxPositions} позиций, дневной лимит убытка ${c.dailyLossPct}%${c.maxNotionalUsd > 0 ? `, потолок позиции ${fmtMoney(c.maxNotionalUsd)}` : ''}.\n\nОстановить новые сделки: node index.js --pause-trading; закрыть все сделки программы: node index.js --close-all.`);
+  }
+  if (!trader.ready) critical('⚠️ Crypto Watcher: автоторговля на Bybit не запустилась', `${trader.describe()}\n\nПроверьте ключ командой node index.js --trade-check. Сигналы и киты работают как обычно; программа будет пробовать подключиться снова каждые 10 минут.`);
 }
 await refreshUniverse(true);
 if (!once) {
@@ -646,7 +779,7 @@ if (!once) {
     const limit = Math.max(cfg.pollSeconds * 10, 15 * 60) * 1000;
     if (since > limit) { console.error(`Сторож: анализ не завершался ${Math.round(since / 60e3)} мин — перезапуск`); try { journal.save(); } catch { /* ignore */ } process.exit(1); }
   }, 60e3).unref();
-  console.log(`Уведомления: ${notifier.channels().join(', ')}`);
+  console.log(`Уведомления: ${notifier.channels({ masked: true }).join(', ')}`);
   if (streamsOn) console.log(`Киты: ${cfg.whales.markets.join(' + ')}, порог от ${fmtUsd(cfg.whales.minUsd)}; письмо — от ${cfg.whales.alertX}× порога и в числе ${cfg.whales.targetPerDay} крупнейших покупок за сутки`);
   console.log(`Порог сигнала ±${cfg.signal.threshold}, подтверждение ${cfg.signal.confirmPolls} проверки, опрос каждые ${cfg.pollSeconds} с. Ctrl+C — выход.\n`);
 }

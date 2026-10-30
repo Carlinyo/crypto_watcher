@@ -140,6 +140,7 @@ export default {
   trade: {
     enabled: bool(env.TRADE, false),
     mode: (env.TRADE_MODE || 'demo').toLowerCase(),  // demo — демо-счёт, live — настоящие деньги, testnet
+    entry: (env.TRADE_ENTRY || 'zone').toLowerCase(), // zone — входить, когда цена в зоне входа; signal — сразу по сигналу
     apiKey: env.BYBIT_API_KEY || '',
     apiSecret: env.BYBIT_API_SECRET || '',
     baseUrl: env.BYBIT_URL || '',                     // по умолчанию — по режиму
@@ -156,6 +157,8 @@ export default {
     tp1Share: 0.5,                                    // доля позиции, которая закрывается на цели 1
     feePct: num(env.TRADE_FEE_PCT, 0.055),            // комиссия тейкера Bybit, % (учитывается в размере позиции)
     slTriggerBy: env.TRADE_SL_TRIGGER || 'LastPrice', // по какой цене срабатывает стоп: LastPrice или MarkPrice
+    maxPerDay: num(env.TRADE_MAX_PER_DAY, 10),       // не больше сделок за день (защита от сбоя, который открывал бы сделку за сделкой)
+    allowAnyIp: bool(env.TRADE_ALLOW_ANY_IP, false),  // реальный счёт с ключом без привязки к IP — только если явно разрешено
     tickSeconds: 10,
   },
 
@@ -169,7 +172,8 @@ export default {
 
   digest: { enabled: bool(env.DIGEST, true), hour: num(env.DIGEST_HOUR, 9) },
 
-  server: { port: num(env.PORT, 8080), host: env.HOST || '127.0.0.1', token: env.DASHBOARD_TOKEN || '' },
+  // веб-панель: по умолчанию только с самого сервера. DASHBOARD_LOCAL_ONLY=1 — порт и так закрыт снаружи (как в docker-compose.yml)
+  server: { port: num(env.PORT, 8080), host: env.HOST || '127.0.0.1', token: env.DASHBOARD_TOKEN || '', localOnly: bool(env.DASHBOARD_LOCAL_ONLY, false) },
 
   files: { state: env.STATE_FILE || 'data/state.json', journal: 'data/journal.json', market: 'data/market.json', trades: 'data/bybit.json' },
 
@@ -189,7 +193,10 @@ export default {
       from: env.TWILIO_FROM || '',
       accountSid: env.TWILIO_SID || '',
       authToken: env.TWILIO_TOKEN || '',
+      maxPerDay: num(env.SMS_MAX_PER_DAY, 20),       // защита от лишних расходов на SMS
     },
+    // о чём писать на почту (подробно — в lib/policy.js); остальное видно в веб-панели
+    events: list(env.EMAIL_EVENTS?.toLowerCase(), ['zone', 'trade', 'whales', 'critical']),
     batchSeconds: num(env.BATCH_SECONDS, 20),
     maxEmailsPerHour: num(env.MAX_EMAILS_PER_HOUR, 30),
     errorAlertAfter: num(env.ERROR_ALERT_AFTER, 10),

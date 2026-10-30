@@ -3,9 +3,10 @@ module.exports = {
   apps: [{
     name: 'crypto-watcher',
     script: 'index.js',
+    node_args: '--disable-proto=delete',
     autorestart: true,
     restart_delay: 10000,
-    max_memory_restart: '500M',
+    max_memory_restart: '600M',
     env: { NODE_ENV: 'production' },
   }],
 };
