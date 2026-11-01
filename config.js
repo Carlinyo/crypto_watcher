@@ -20,6 +20,19 @@ export default {
     cacheFile: 'data/universe.json',
   },
 
+  // 📈 акции США: бессрочные фьючерсы Binance на акции (контракты TRADIFI_PERPETUAL — NVDAUSDT, AAPLUSDT…)
+  stocks: {
+    // auto — крупнейшие компании США по капитализации; свой список тикеров: AAPL,NVDA,TSLA; 0 — не следить за акциями
+    list: list(env.STOCKS, ['auto']),
+    size: num(env.STOCKS_TOP, 15),
+    // когда по акциям приходят сигналы: regular — основная сессия 9:30–16:00 по Нью-Йорку; extended — 4:00–20:00; any — всегда, когда идут торги
+    hours: (env.STOCK_HOURS || 'regular').toLowerCase(),
+    index: list(env.STOCK_INDEX, ['QQQ', 'SPY']),     // фон рынка акций (вместо биткоина у альткоинов): первый из доступных
+    closedMinutes: 30,                                // по контракту нет сделок столько минут — торги закрыты
+    candles: { m15: 1000, h1: 1500, h4: 1000, d1: 500 }, // больше истории: часы без торгов из неё выбрасываются
+    cacheFile: 'data/stocks.json',
+  },
+
   // сколько свечей держать по каждому таймфрейму
   candles: { m15: 400, h1: 500, h4: 500, d1: 500 },
   pollSeconds: num(env.POLL, 60),
@@ -61,6 +74,9 @@ export default {
   derivatives: { enabled: bool(env.DERIVATIVES, true), period: '1h' },
 
   coinbase: { enabled: bool(env.COINBASE, true), api: 'https://api.exchange.coinbase.com', refreshSeconds: 120 },
+
+  // 🎲 опционы Deribit по BTC и ETH: риск-реверсал, путы/коллы, «максимальная боль», подразумеваемая волатильность
+  options: { enabled: bool(env.OPTIONS, true), api: 'https://www.deribit.com/api/v2', currencies: ['BTC', 'ETH'], refreshMinutes: 15 },
 
   market: { globalMinutes: 30, fearGreedUrl: 'https://api.alternative.me/fng/?limit=30' },
 
@@ -159,6 +175,7 @@ export default {
     slTriggerBy: env.TRADE_SL_TRIGGER || 'LastPrice', // по какой цене срабатывает стоп: LastPrice или MarkPrice
     maxPerDay: num(env.TRADE_MAX_PER_DAY, 10),       // не больше сделок за день (защита от сбоя, который открывал бы сделку за сделкой)
     allowAnyIp: bool(env.TRADE_ALLOW_ANY_IP, false),  // реальный счёт с ключом без привязки к IP — только если явно разрешено
+    stocks: bool(env.TRADE_STOCKS, false),            // открывать сделки и по акциям (фьючерсы на акции Bybit) — по умолчанию нет
     tickSeconds: 10,
   },
 

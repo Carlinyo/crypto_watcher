@@ -6,6 +6,9 @@
 //   node backtest.js BTCUSDT SOLUSDT --days 180
 //   node backtest.js --grid                   — перебрать пороги и подсказать лучший
 //   флаги: --days N  --step K (анализ раз в K часов)  --fast (без 15m)  --threshold X
+//          --entry zone|signal (как TRADE_ENTRY: ждать цену в зоне входа или входить сразу по сигналу)
+//   node backtest.js --stocks                 — акции из списка программы (фьючерсы на акции Binance)
+//   node backtest.js NVDAUSDT AAPLUSDT        — свои акции: фьючерс на акцию распознаётся сам
 //
 // Важно: в истории нет стакана, деривативов, потока сделок и новостей — эти блоки в бэктесте
 // не участвуют, оценка строится по уровням, тренду, индикаторам и паттернам.
@@ -21,6 +24,8 @@ const { default: cfg } = await import('./config.js');
 const { Binance } = await import('./lib/binance.js');
 const { analyze, decide } = await import('./lib/analyzer.js');
 const { fmt } = await import('./lib/format.js');
+const { priceInZone, zoneEntry } = await import('./lib/policy.js');
+const { STOCK_CANDIDATES, tradedOnly } = await import('./lib/stocks.js');
 const { MacroCalendar } = await import('./lib/calendar.js');
 const calendar = new MacroCalendar(path.join(dir, cfg.macro.file));
 
@@ -31,24 +36,32 @@ const days = Number(flag('days', 90));
 const step = Math.max(1, Number(flag('step', 1)));
 const baseThr = Number(flag('threshold', cfg.signal.threshold));
 const grid = bool('grid');
+const entryMode = flag('entry', cfg.trade.entry) === 'signal' ? 'signal' : 'zone';
 const fast = bool('fast');
+const stocksMode = bool('stocks');
 cfg.signal.threshold = baseThr;
+const binance = new Binance(cfg);
+const DAY = 86400e3, H = 3600e3;
+await binance.loadFuturesInfo().catch(() => null); // какие символы — фьючерсы на акции
 
 let symbols = args.map((s) => s.toUpperCase());
+if (!symbols.length && stocksMode) {
+  try { symbols = JSON.parse(fs.readFileSync(path.join(dir, cfg.stocks.cacheFile), 'utf8')).stocks.map((c) => c.symbol); } catch { symbols = STOCK_CANDIDATES.slice(0, cfg.stocks.size).map((c) => `${c.ticker.replace(/[^A-Z0-9]/g, '')}USDT`).filter((s) => binance.stockOf(s)); }
+}
 if (!symbols.length) {
   try { symbols = JSON.parse(fs.readFileSync(path.join(dir, cfg.universe.cacheFile), 'utf8')).coins.map((c) => c.symbol); } catch { symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']; }
 }
-if (symbols.length > 1 && !symbols.includes('BTCUSDT')) symbols.unshift('BTCUSDT'); // контекст биткоина для альтов
-const binance = new Binance(cfg);
-const DAY = 86400e3, H = 3600e3;
+// акция — фьючерс на акцию Binance (TRADIFI_PERPETUAL), у которого нет обычного криптоконтракта
+const isStockSym = (s) => !!binance.stockOf(s) && !binance.futuresOf(s);
+if (symbols.filter((s) => !isStockSym(s)).length > 1 && !symbols.includes('BTCUSDT')) symbols.unshift('BTCUSDT'); // контекст биткоина для альтов
 
-async function history(symbol, interval, nDays) {
-  const file = path.join(dir, 'data', 'history', `${symbol}-${interval}-${nDays}.json`);
+async function history(symbol, interval, nDays, market = 'spot') {
+  const file = path.join(dir, 'data', 'history', `${market === 'spot' ? '' : 'f-'}${symbol}-${interval}-${nDays}.json`);
   try {
     const st = fs.statSync(file);
     if (Date.now() - st.mtimeMs < 6 * H) return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch { /* нет кэша */ }
-  const rows = await binance.klinesHistory(symbol, interval, Date.now() - nDays * DAY);
+  const rows = await binance.klinesHistory(symbol, interval, Date.now() - nDays * DAY, Date.now(), market);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(rows));
   return rows;
@@ -64,7 +77,7 @@ function analyzeAt(sym, data, i, price, btcAt) {
   const t = data.h1[i].closeTime;
   const i4 = data.c4(t), iD = data.cD(t), i15 = data.c15 ? data.c15(t) : -1;
   const bundle = {
-    symbol: sym, price, closedOnly: true, now: t,
+    symbol: sym, kind: data.kind, price, closedOnly: true, now: t,
     candles: {
       h1: data.h1.slice(Math.max(0, i - 499), i + 1),
       h4: i4 >= 0 ? data.h4.slice(Math.max(0, i4 - 499), i4 + 1) : null,
@@ -77,15 +90,20 @@ function analyzeAt(sym, data, i, price, btcAt) {
   return analyze(bundle, cfg);
 }
 
-const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.plan, core: r.core, trend: r.blocks.trend.score });
+const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.plan, core: r.core, trend: r.blocks.trend.score, atr: r.stats.atr });
 
 // ── симуляция сделок по сохранённым оценкам ───────────────────────────────
+// Правила входа — как у работающей программы (TRADE_ENTRY=zone): сильный сигнал, если цена уже в зоне входа, —
+// вход сразу; если нет — ждём цену в зоне; «готовиться» — тоже ждём зону. Цена дошла до зоны — свежий анализ:
+// вход, если оценка в ту же сторону не слабее 70% порога, прибыль/риск от MIN_RR и нет запретов (ФРС, новость, биткоин).
+// --entry signal — как TRADE_ENTRY=signal: сильный сигнал — вход сразу, где бы ни была цена.
 function simulate(sym, data, recs, thr, zoneCache) {
   const c = { ...cfg, signal: { ...cfg.signal, threshold: thr } };
   const feePct = (cfg.risk.feePct ?? 0.2) / 100;
   const expire = cfg.journal.expireHours;
   const trades = [];
   let open = null, zone = null, lastSig = -1e9;
+  const dec = (x) => decide({ ...x.core, score: x.score, agreement: x.agreement, completeness: x.completeness, regime: x.regime, plan: x.plan }, c);
 
   const close = (j, price, why) => {
     const s = open.side === 'BUY' ? 1 : -1;
@@ -101,6 +119,7 @@ function simulate(sym, data, recs, thr, zoneCache) {
     // если вход заметно хуже расчётного — стоп/цели остаются по плану (как в реальной жизни)
     if ((side === 'BUY' && entry <= plan.stop) || (side === 'SELL' && entry >= plan.stop)) open = null;
   };
+  const arm = (j, rec) => { const p = rec.plan; zone = { dir: p.dir, low: p.zone[0], high: p.zone[1], stop: p.stop, armed: j, until: j + cfg.signal.zoneValidHours }; };
 
   for (let j = data.start; j < data.h1.length; j++) {
     const bar = data.h1[j];
@@ -115,7 +134,7 @@ function simulate(sym, data, recs, thr, zoneCache) {
         if (open && j - open.entryIdx >= expire) close(j, bar.close, 'expired');
       }
     }
-    // вход по зоне: цена дошла до зоны «готовиться»
+    // цена дошла до зоны входа
     if (!open && zone && j > zone.armed && j <= zone.until) {
       const hit = zone.dir === 'BUY' ? bar.low <= zone.high : bar.high >= zone.low;
       if (hit) {
@@ -123,26 +142,33 @@ function simulate(sym, data, recs, thr, zoneCache) {
         const key = `${j}:${px}`;
         let rz = zoneCache.get(key);
         if (!rz) { rz = compact(analyzeAt(sym, data, j - 1, px, data.btcAt)); zoneCache.set(key, rz); }
-        const d = decide({ ...rz.core, score: rz.score, agreement: rz.agreement, completeness: rz.completeness, regime: rz.regime, plan: rz.plan }, c);
-        const dirOk = zone.dir === 'BUY' ? rz.score > 0 : rz.score < 0;
-        if (dirOk && Math.abs(rz.score) >= d.threshold * cfg.signal.zoneTriggerRatio && rz.plan.rrNow >= cfg.signal.minRiskReward && !d.warnings.length) {
-          openTrade(j, zone.dir, px, rz.plan, 'зона', rz);
+        const d = dec(rz);
+        const res = zoneEntry(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, plan: rz.plan }, { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio });
+        if (res.ok) {
+          openTrade(j, zone.dir, px, res.plan, 'зона', rz);
           lastSig = j;
+          zone = null;
           // после входа внутри свечи проверяем только стоп (консервативно)
-          if (open && (zone.dir === 'BUY' ? bar.low <= open.stop : bar.high >= open.stop)) close(j, open.stop, 'stop');
-        }
-        zone = null;
+          if (open && (open.side === 'BUY' ? bar.low <= open.stop : bar.high >= open.stop)) close(j, open.stop, 'stop');
+        } else if (res.flip) zone = null; // иначе зона остаётся — проверим снова на следующей свече
       }
+      // цена ушла за стоп — зона больше не актуальна
+      if (zone && (zone.dir === 'BUY' ? bar.low < zone.stop : bar.high > zone.stop)) zone = null;
     }
+    if (zone && j > zone.until) zone = null;
     const rec = recs.get(j);
     if (!rec) continue;
-    const d = decide({ ...rec.core, score: rec.score, agreement: rec.agreement, completeness: rec.completeness, regime: rec.regime, plan: rec.plan }, c);
+    const d = dec(rec);
     if (d.action === 'BUY' || d.action === 'SELL') {
       if (open && open.side === d.action) continue;
       if (open) close(j, bar.close, 'reversed');
-      if (j - lastSig >= 2 && j + 1 < data.h1.length) { openTrade(j + 1, d.action, data.h1[j + 1].open, rec.plan, 'сигнал', rec); lastSig = j; zone = null; }
-    } else if (d.action.startsWith('WATCH') && d.zoneOk && !open) {
-      zone = { dir: rec.plan.dir, low: rec.plan.zone[0], high: rec.plan.zone[1], armed: j, until: j + cfg.signal.zoneValidHours };
+      const inZone = priceInZone({ dir: rec.plan.dir, low: rec.plan.zone[0], high: rec.plan.zone[1], atr: rec.atr }, bar.close);
+      if (entryMode === 'signal' || inZone) {
+        if (j - lastSig >= 2 && j + 1 < data.h1.length) { openTrade(j + 1, d.action, data.h1[j + 1].open, rec.plan, 'сигнал', rec); lastSig = j; zone = null; }
+      } else arm(j, rec);
+    } else if (d.action.startsWith('WATCH') && !open) {
+      if (d.zoneOk) arm(j, rec);
+      else zone = null;
     } else if (d.action === 'NEUTRAL' && zone && Math.abs(rec.score) < d.threshold * 0.3) zone = null;
   }
   if (open) close(data.h1.length - 1, data.h1[data.h1.length - 1].close, 'открыта на конец');
@@ -164,13 +190,14 @@ function stats(trades) {
 
 const pad = (s, n) => String(s).padStart(n);
 const pf = (x) => (x == null ? '—' : x === Infinity ? '∞' : x.toFixed(2));
-const row = (name, s) => `${name.padEnd(12)}${pad(s.n, 7)}${pad(s.winRate == null ? '—' : `${(s.winRate * 100).toFixed(0)}%`, 8)}${pad(s.tp1 == null ? '—' : `${(s.tp1 * 100).toFixed(0)}%`, 8)}${pad(s.avgR == null ? '—' : s.avgR.toFixed(2), 8)}${pad(s.sumR.toFixed(1), 9)}${pad(pf(s.pf), 7)}${pad(s.maxDD.toFixed(1), 10)}`;
-const HEAD = `${'монета'.padEnd(12)}${pad('сделок', 7)}${pad('успех', 8)}${pad('цель1', 8)}${pad('ср. R', 8)}${pad('сумма R', 9)}${pad('PF', 7)}${pad('просадка', 10)}`;
+const perDay = (n) => (n / days < 0.1 ? (n / days).toFixed(2) : (n / days).toFixed(1));
+const row = (name, s) => `${name.padEnd(12)}${pad(s.n, 7)}${pad(perDay(s.n), 8)}${pad(s.winRate == null ? '—' : `${(s.winRate * 100).toFixed(0)}%`, 8)}${pad(s.tp1 == null ? '—' : `${(s.tp1 * 100).toFixed(0)}%`, 8)}${pad(s.avgR == null ? '—' : s.avgR.toFixed(2), 8)}${pad(s.sumR.toFixed(1), 9)}${pad(pf(s.pf), 7)}${pad(s.maxDD.toFixed(1), 10)}`;
+const HEAD = `${'монета'.padEnd(12)}${pad('сделок', 7)}${pad('в день', 8)}${pad('успех', 8)}${pad('цель1', 8)}${pad('ср. R', 8)}${pad('сумма R', 9)}${pad('PF', 7)}${pad('просадка', 10)}`;
 const WHY_RU = { stop: 'стоп', breakeven: 'цель 1 → безубыток', trail: 'цель 1 → подтянутый стоп', tp2: 'цель 2', expired: 'истекло время', reversed: 'обратный сигнал' };
 const REG_RU = { trend_up: 'восх. тренд', trend_down: 'нисх. тренд', range: 'боковик', squeeze: 'сжатие', volatile: 'волатильно', transition: 'переходный' };
 
 // ── прогон ────────────────────────────────────────────────────────────────
-console.log(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr}${fast ? ' | без 15m' : ''}`);
+console.log(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr} | вход ${entryMode === 'signal' ? 'сразу по сигналу' : 'в зоне входа'}${fast ? ' | без 15m' : ''}`);
 console.log('Загрузка истории (кэшируется в data/history)…');
 const all = new Map();
 const btcScores = new Map();
@@ -179,17 +206,21 @@ const t0 = Date.now();
 
 for (const sym of symbols) {
   let data;
+  const stock = isStockSym(sym);
   try {
-    const [h1, h4, d1, m15] = await Promise.all([
-      history(sym, '1h', days + 25), history(sym, '4h', days + 90), history(sym, '1d', days + 400),
-      fast ? Promise.resolve(null) : history(sym, '15m', days + 5),
-    ]);
-    data = { h1, h4, d1, m15, c4: cursor(h4), cD: cursor(d1), c15: m15 ? cursor(m15) : null };
+    // акция: свечи фьючерса на акцию, часы без торгов выбрасываются; истории нужно больше (торгов — несколько часов в день)
+    const mk = stock ? 'futures' : 'spot', keep = stock ? tradedOnly : (x) => x;
+    const [h1, h4, d1, m15] = (await Promise.all([
+      history(sym, '1h', days + (stock ? 120 : 25), mk), history(sym, '4h', days + 90, mk), history(sym, '1d', days + 400, mk),
+      fast ? Promise.resolve(null) : history(sym, '15m', days + 5, mk),
+    ])).map((x) => (x ? keep(x) : x));
+    data = { h1, h4, d1, m15, c4: cursor(h4), cD: cursor(d1), c15: m15 ? cursor(m15) : null, kind: stock ? 'stock' : 'crypto' };
   } catch (e) { console.error(`${sym}: не удалось загрузить историю — ${e.message}`); continue; }
-  if (data.h1.length < 600) { console.error(`${sym}: мало истории (${data.h1.length} ч) — пропускаю`); continue; }
+  const warm = stock ? 250 : 500;
+  if (data.h1.length < warm + 100) { console.error(`${sym}: мало истории (${data.h1.length} ч с торгами) — пропускаю`); continue; }
   const startT = Date.now() - days * DAY;
-  data.start = Math.max(500, data.h1.findIndex((c) => c.time >= startT));
-  if (sym !== 'BTCUSDT' && btcData) {
+  data.start = Math.max(warm, data.h1.findIndex((c) => c.time >= startT));
+  if (!stock && sym !== 'BTCUSDT' && btcData) {
     const btcH1 = btcData.h1;
     const cb = cursor(btcH1);
     data.btcAt = (t) => {
@@ -226,6 +257,7 @@ const main = summary.find((s) => s.thr === baseThr) ?? summary[0];
 console.log(`\nРезультаты при пороге ${main.thr} (комиссия ${cfg.risk.feePct}% учтена):\n${HEAD}`);
 for (const [sym, t] of main.per) console.log(row(sym.replace(/USDT$/, ''), stats(t)));
 console.log(row('ИТОГО', main.stats));
+console.log(`В среднем ${perDay(main.stats.n)} сделки в день по всем монетам (${(main.stats.n / days / Math.max(1, main.per.length)).toFixed(2)} на монету).`);
 const byWhy = {};
 for (const t of main.trades) byWhy[t.why] = (byWhy[t.why] ?? 0) + 1;
 console.log(`\nЧем закончились сделки: ${Object.entries(byWhy).map(([k, v]) => `${WHY_RU[k] ?? k} ${v}`).join(', ') || '—'}`);

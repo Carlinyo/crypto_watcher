@@ -117,8 +117,9 @@ export class MockBybit {
     switch (path) {
       case '/v5/market/time': { const t = Date.now(); return ok({ timeSecond: String(Math.floor(t / 1000)), timeNano: `${t}000000` }); }
       case '/v5/market/instruments-info':
-        return ok({ category: 'linear', nextPageCursor: '', list: [...this.inst.values()].map((x) => ({
-          symbol: x.symbol, contractType: 'LinearPerpetual', status: 'Trading', baseCoin: x.symbol.replace(/USDT$/, ''), quoteCoin: 'USDT', settleCoin: 'USDT',
+        // фьючерсы на акции (symbolType: stock) — только по отдельному запросу symbolType=stock
+        return ok({ category: 'linear', nextPageCursor: '', list: [...this.inst.values()].filter((x) => (q.symbolType ? x.symbolType === q.symbolType : !x.symbolType)).map((x) => ({
+          symbol: x.symbol, contractType: 'LinearPerpetual', status: 'Trading', baseCoin: x.symbol.replace(/USDT$/, ''), quoteCoin: 'USDT', settleCoin: 'USDT', symbolType: x.symbolType ?? '',
           priceFilter: { minPrice: x.tick, maxPrice: '1999999', tickSize: x.tick }, leverageFilter: { minLeverage: '1', maxLeverage: x.maxLev, leverageStep: '0.01' },
           lotSizeFilter: { maxOrderQty: x.maxMkt, maxMktOrderQty: x.maxMkt, minOrderQty: x.minQty, qtyStep: x.step, minNotionalValue: '5' },
         })) });
