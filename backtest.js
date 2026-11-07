@@ -6,7 +6,8 @@
 //   node backtest.js BTCUSDT SOLUSDT --days 180
 //   node backtest.js --grid                   — перебрать пороги и подсказать лучший
 //   флаги: --days N  --step K (анализ раз в K часов)  --fast (без 15m)  --threshold X
-//          --entry zone|signal (как TRADE_ENTRY: ждать цену в зоне входа или входить сразу по сигналу)
+//          --entry retest|touch|signal (как TRADE_ENTRY: на ретесте уровня, при касании зоны — как в 2.7, сразу по сигналу)
+//   node backtest.js --compare                — три способа входа рядом на одних и тех же данных
 //   node backtest.js --stocks                 — акции из списка программы (фьючерсы на акции Binance)
 //   node backtest.js NVDAUSDT AAPLUSDT        — свои акции: фьючерс на акцию распознаётся сам
 //
@@ -25,6 +26,7 @@ const { Binance } = await import('./lib/binance.js');
 const { analyze, decide } = await import('./lib/analyzer.js');
 const { fmt } = await import('./lib/format.js');
 const { priceInZone, zoneEntry } = await import('./lib/policy.js');
+const { touches, isConfirmation, retestPlan } = await import('./lib/entry.js');
 const { STOCK_CANDIDATES, tradedOnly } = await import('./lib/stocks.js');
 const { MacroCalendar } = await import('./lib/calendar.js');
 const calendar = new MacroCalendar(path.join(dir, cfg.macro.file));
@@ -36,8 +38,12 @@ const days = Number(flag('days', 90));
 const step = Math.max(1, Number(flag('step', 1)));
 const baseThr = Number(flag('threshold', cfg.signal.threshold));
 const grid = bool('grid');
-const entryMode = flag('entry', cfg.trade.entry) === 'signal' ? 'signal' : 'zone';
+const ENTRY_MODES = { retest: 'на ретесте уровня', touch: 'при касании зоны (как в 2.7)', signal: 'сразу по сигналу' };
+const entryMode = ((v) => (v === 'zone' ? 'retest' : ENTRY_MODES[v] ? v : 'retest'))(String(flag('entry', cfg.trade.entry)).toLowerCase());
+const compare = bool('compare');
 const fast = bool('fast');
+// анализ — с планом для входа на ретесте и планом как в 2.7 (b.legacyPlan), способ входа выбирает симуляция
+const acfg = { ...cfg, trade: { ...cfg.trade, entry: 'retest' } };
 const stocksMode = bool('stocks');
 cfg.signal.threshold = baseThr;
 const binance = new Binance(cfg);
@@ -86,24 +92,49 @@ function analyzeAt(sym, data, i, price, btcAt) {
     },
     btc: btcAt ? btcAt(t) : null,
     macro: { risk: calendar.risk(t), next: calendar.next(t) },
+    legacyPlan: true,
   };
-  return analyze(bundle, cfg);
+  return analyze(bundle, acfg);
 }
 
-const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.plan, core: r.core, trend: r.blocks.trend.score, atr: r.stats.atr });
+const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.plan, planLegacy: r.planLegacy, core: r.core, trend: r.blocks.trend.score, atr: r.stats.atr });
 
 // ── симуляция сделок по сохранённым оценкам ───────────────────────────────
-// Правила входа — как у работающей программы (TRADE_ENTRY=zone): сильный сигнал, если цена уже в зоне входа, —
-// вход сразу; если нет — ждём цену в зоне; «готовиться» — тоже ждём зону. Цена дошла до зоны — свежий анализ:
-// вход, если оценка в ту же сторону не слабее 70% порога, прибыль/риск от MIN_RR и нет запретов (ФРС, новость, биткоин).
-// --entry signal — как TRADE_ENTRY=signal: сильный сигнал — вход сразу, где бы ни была цена.
-function simulate(sym, data, recs, thr, zoneCache) {
-  const c = { ...cfg, signal: { ...cfg.signal, threshold: thr } };
+// Способы входа (--entry, как TRADE_ENTRY; --compare — все три на одних данных):
+//   retest (по умолчанию) — сильный сигнал или «готовиться» ставит ожидание у уровня (ретест пробитого уровня
+//     или отскок от поддержки). Цена коснулась уровня → после каждой закрытой 15-минутной свечи — проверка
+//     подтверждения (свеча от уровня в сторону сделки) → свежий анализ → вход по закрытию этой свечи.
+//     Стоп — за уровнем и за экстремумом ретеста; часовая свеча, закрывшаяся за уровнем, снимает ожидание;
+//   touch — как в 2.7: сильный сигнал, если цена уже в зоне входа, — вход сразу; иначе — как только цена войдёт в зону;
+//   signal — сильный сигнал — вход сразу, где бы ни была цена.
+// Вход по свежему анализу — если оценка в ту же сторону не слабее 70% порога, прибыль/риск от MIN_RR и нет запретов.
+function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
+  const c = { ...cfg, signal: { ...cfg.signal, threshold: thr }, trade: { ...cfg.trade, entry: mode } };
+  const legacy = mode !== 'retest';
+  const planOf = (x) => (legacy ? x.planLegacy ?? x.plan : x.plan);
   const feePct = (cfg.risk.feePct ?? 0.2) / 100;
   const expire = cfg.journal.expireHours;
+  const rule = { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio };
   const trades = [];
   let open = null, zone = null, lastSig = -1e9;
-  const dec = (x) => decide({ ...x.core, score: x.score, agreement: x.agreement, completeness: x.completeness, regime: x.regime, plan: x.plan }, c);
+  const dec = (x) => decide({ ...x.core, score: x.score, agreement: x.agreement, completeness: x.completeness, regime: x.regime, plan: planOf(x) }, c);
+  // свежий анализ в момент входа: по данным на закрытие прошлого часа, с ценой px (кэш общий для всех способов)
+  const freshAt = (j, px) => {
+    const key = `${j}:${px}`;
+    let rz = zoneCache.get(key);
+    if (!rz) { rz = compact(analyzeAt(sym, data, j - 1, px, data.btcAt)); zoneCache.set(key, rz); }
+    return rz;
+  };
+  // 15-минутные свечи внутри часа (без 15m — сам час)
+  let p15 = 0;
+  const subOf = (bar) => {
+    const m = data.m15;
+    if (!m) return [bar];
+    while (p15 < m.length && m[p15].time < bar.time) p15++;
+    const out = [];
+    for (let q = p15; q < m.length && m[q].time < bar.time + H; q++) out.push(m[q]);
+    return out.length ? out : [bar];
+  };
 
   const close = (j, price, why) => {
     const s = open.side === 'BUY' ? 1 : -1;
@@ -119,7 +150,15 @@ function simulate(sym, data, recs, thr, zoneCache) {
     // если вход заметно хуже расчётного — стоп/цели остаются по плану (как в реальной жизни)
     if ((side === 'BUY' && entry <= plan.stop) || (side === 'SELL' && entry >= plan.stop)) open = null;
   };
-  const arm = (j, rec) => { const p = rec.plan; zone = { dir: p.dir, low: p.zone[0], high: p.zone[1], stop: p.stop, armed: j, until: j + cfg.signal.zoneValidHours }; };
+  const arm = (j, rec) => {
+    const p = planOf(rec);
+    // идёт ретест (цена у уровня) — уровень и касание не меняются при пересчёте, как у работающей программы
+    if (zone && zone.level && zone.touched != null && zone.dir === p.dir) return;
+    const level = legacy ? null : p.level;
+    // план обновился, а уровень тот же — касание и экстремум ретеста сохраняются
+    const keep = zone && zone.dir === p.dir && zone.touched != null && level && zone.level && level.low <= zone.level.high && level.high >= zone.level.low;
+    zone = { dir: p.dir, low: p.zone[0], high: p.zone[1], stop: p.stop, atr: rec.atr, level, armed: j, until: j + cfg.signal.zoneValidHours, touched: keep ? zone.touched : null, ext: keep ? zone.ext : null };
+  };
 
   for (let j = data.start; j < data.h1.length; j++) {
     const bar = data.h1[j];
@@ -134,41 +173,75 @@ function simulate(sym, data, recs, thr, zoneCache) {
         if (open && j - open.entryIdx >= expire) close(j, bar.close, 'expired');
       }
     }
-    // цена дошла до зоны входа
     if (!open && zone && j > zone.armed && j <= zone.until) {
-      const hit = zone.dir === 'BUY' ? bar.low <= zone.high : bar.high >= zone.low;
-      if (hit) {
-        const px = zone.dir === 'BUY' ? Math.min(bar.open, zone.high) : Math.max(bar.open, zone.low);
-        const key = `${j}:${px}`;
-        let rz = zoneCache.get(key);
-        if (!rz) { rz = compact(analyzeAt(sym, data, j - 1, px, data.btcAt)); zoneCache.set(key, rz); }
-        const d = dec(rz);
-        const res = zoneEntry(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, plan: rz.plan }, { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio });
-        if (res.ok) {
-          openTrade(j, zone.dir, px, res.plan, 'зона', rz);
-          lastSig = j;
-          zone = null;
-          // после входа внутри свечи проверяем только стоп (консервативно)
-          if (open && (open.side === 'BUY' ? bar.low <= open.stop : bar.high >= open.stop)) close(j, open.stop, 'stop');
-        } else if (res.flip) zone = null; // иначе зона остаётся — проверим снова на следующей свече
+      if (zone.level) {
+        // 🎯 ретест: касание уровня → закрытая 15-минутная свеча подтверждает отскок → вход по её закрытию
+        const buy = zone.dir === 'BUY', L = zone.level, atr = zone.atr;
+        const subs = subOf(bar);
+        for (let q = 0; q < subs.length && zone; q++) {
+          const k = subs[q], ext = buy ? k.low : k.high;
+          if (zone.touched == null) {
+            if (!touches(zone, ext)) continue;
+            zone.touched = k.time; zone.ext = ext;
+          } else zone.ext = buy ? Math.min(zone.ext, ext) : Math.max(zone.ext, ext);
+          if (buy ? k.low < zone.stop : k.high > zone.stop) { zone = null; break; } // прошла за стоп — уровень пробит
+          if (!isConfirmation(zone, k)) {
+            if (buy ? k.close > L.high + atr : k.close < L.low - atr) { zone.touched = null; zone.ext = null; } // ушла без подтверждения
+            continue;
+          }
+          const px = k.close, rz = freshAt(j, px), d = dec(rz);
+          const plan = retestPlan(planOf(rz), zone, { price: px, ext: zone.ext, atr: rz.atr, stopMult: rz.regime.stopMult ?? 1, risk: cfg.risk });
+          const res = zoneEntry(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, plan }, rule);
+          if (res.ok) {
+            openTrade(j, zone.dir, px, plan, L.role === 'breakout' ? 'ретест' : 'отскок', rz);
+            lastSig = j;
+            zone = null;
+            // остаток часа после входа — только стоп (консервативно)
+            if (open) for (const k2 of subs.slice(q + 1)) if (buy ? k2.low <= open.stop : k2.high >= open.stop) { close(j, open.stop, 'stop'); break; }
+            break;
+          }
+          if (res.flip) { zone = null; break; }
+        }
+        // часовая свеча закрылась за уровнем — уровень не удержался
+        if (zone && zone.touched != null && (buy ? bar.close < L.low - 0.1 * atr : bar.close > L.high + 0.1 * atr)) zone = null;
+      } else {
+        // как в 2.7: цена дошла до зоны входа — свежий анализ и вход сразу
+        const hit = zone.dir === 'BUY' ? bar.low <= zone.high : bar.high >= zone.low;
+        if (hit) {
+          const px = zone.dir === 'BUY' ? Math.min(bar.open, zone.high) : Math.max(bar.open, zone.low);
+          const rz = freshAt(j, px);
+          const d = dec(rz);
+          const res = zoneEntry(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, plan: planOf(rz) }, rule);
+          if (res.ok) {
+            openTrade(j, zone.dir, px, res.plan, 'зона', rz);
+            lastSig = j;
+            zone = null;
+            // после входа внутри свечи проверяем только стоп (консервативно)
+            if (open && (open.side === 'BUY' ? bar.low <= open.stop : bar.high >= open.stop)) close(j, open.stop, 'stop');
+          } else if (res.flip) zone = null; // иначе зона остаётся — проверим снова на следующей свече
+        }
+        // цена ушла за стоп — зона больше не актуальна
+        if (zone && (zone.dir === 'BUY' ? bar.low < zone.stop : bar.high > zone.stop)) zone = null;
       }
-      // цена ушла за стоп — зона больше не актуальна
-      if (zone && (zone.dir === 'BUY' ? bar.low < zone.stop : bar.high > zone.stop)) zone = null;
     }
     if (zone && j > zone.until) zone = null;
     const rec = recs.get(j);
     if (!rec) continue;
-    const d = dec(rec);
+    const d = dec(rec), p = planOf(rec);
     if (d.action === 'BUY' || d.action === 'SELL') {
       if (open && open.side === d.action) continue;
       if (open) close(j, bar.close, 'reversed');
-      const inZone = priceInZone({ dir: rec.plan.dir, low: rec.plan.zone[0], high: rec.plan.zone[1], atr: rec.atr }, bar.close);
-      if (entryMode === 'signal' || inZone) {
-        if (j - lastSig >= 2 && j + 1 < data.h1.length) { openTrade(j + 1, d.action, data.h1[j + 1].open, rec.plan, 'сигнал', rec); lastSig = j; zone = null; }
-      } else arm(j, rec);
+      const inZone = priceInZone({ dir: p.dir, low: p.zone[0], high: p.zone[1], atr: rec.atr }, bar.close);
+      if (mode === 'signal' || (mode === 'touch' && inZone)) {
+        if (j - lastSig >= 2 && j + 1 < data.h1.length) { openTrade(j + 1, d.action, data.h1[j + 1].open, p, 'сигнал', rec); lastSig = j; zone = null; }
+      } else {
+        arm(j, rec);
+        // цена уже у уровня — касание засчитано, подтверждение — по следующим 15-минутным свечам
+        if (zone.level && inZone && zone.touched == null) { zone.touched = bar.time; zone.ext = p.dir === 'BUY' ? bar.low : bar.high; }
+      }
     } else if (d.action.startsWith('WATCH') && !open) {
       if (d.zoneOk) arm(j, rec);
-      else zone = null;
+      else if (!(zone && zone.level && zone.touched != null && zone.dir === p.dir)) zone = null;
     } else if (d.action === 'NEUTRAL' && zone && Math.abs(rec.score) < d.threshold * 0.3) zone = null;
   }
   if (open) close(data.h1.length - 1, data.h1[data.h1.length - 1].close, 'открыта на конец');
@@ -197,7 +270,7 @@ const WHY_RU = { stop: 'стоп', breakeven: 'цель 1 → безубыток
 const REG_RU = { trend_up: 'восх. тренд', trend_down: 'нисх. тренд', range: 'боковик', squeeze: 'сжатие', volatile: 'волатильно', transition: 'переходный' };
 
 // ── прогон ────────────────────────────────────────────────────────────────
-console.log(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr} | вход ${entryMode === 'signal' ? 'сразу по сигналу' : 'в зоне входа'}${fast ? ' | без 15m' : ''}`);
+console.log(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr} | вход ${compare ? 'всеми тремя способами' : ENTRY_MODES[entryMode]}${fast ? ' | без 15m (подтверждение ретеста — по часовым свечам)' : ''}`);
 console.log('Загрузка истории (кэшируется в data/history)…');
 const all = new Map();
 const btcScores = new Map();
@@ -269,6 +342,23 @@ const byVia = {};
 for (const t of main.trades) (byVia[t.via] ??= []).push(t);
 console.log('По способу входа:');
 for (const [k, t] of Object.entries(byVia)) console.log(`  ${row(k, stats(t))}`);
+
+// сравнение способов входа на одних и тех же оценках: ретест (2.8), касание зоны (2.7), сразу по сигналу
+if (compare) {
+  console.log(`\nСравнение способов входа (порог ${main.thr}):\n${'способ'.padEnd(12)}${HEAD.slice(12)}`);
+  const cmp = [];
+  for (const [m, name] of [['retest', 'ретест'], ['touch', 'касание 2.7'], ['signal', 'по сигналу']]) {
+    const tr = m === entryMode ? main.trades : [...all].flatMap(([sym, x]) => simulate(sym, x.data, x.recs, main.thr, x.zoneCache, m));
+    const st = stats(tr);
+    cmp.push({ m, st });
+    console.log(row(name, st));
+  }
+  const [rt, tc] = cmp;
+  if (rt.st.n >= 10 && tc.st.n >= 10) {
+    const better = rt.st.avgR > tc.st.avgR && (rt.st.pf ?? 0) >= (tc.st.pf ?? 0);
+    console.log(`\n${better ? 'Вход на ретесте лучше прежнего' : 'Вход на ретесте на этих данных не лучше прежнего'}: в среднем ${rt.st.avgR.toFixed(2)}R против ${tc.st.avgR.toFixed(2)}R на сделку, PF ${pf(rt.st.pf)} против ${pf(tc.st.pf)}, сделок ${rt.st.n} против ${tc.st.n}.`);
+  } else console.log('\nСделок мало для вывода — увеличьте период (--days 180) или добавьте монеты.');
+}
 
 if (grid) {
   console.log(`\nПеребор порога:\n${'порог'.padEnd(12)}${HEAD.slice(12)}`);

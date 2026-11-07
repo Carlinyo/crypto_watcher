@@ -1,6 +1,6 @@
 {
   "name": "crypto-signal-watcher",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Круглосуточный анализ топ-криптовалют: уровни, тренд, деривативы, стакан, киты, паттерны, новости, макрокалендарь — уведомления о хорошей цене для покупки или продажи и автоторговля на Bybit",
   "type": "module",
   "main": "index.js",
@@ -17,6 +17,7 @@
     "why": "node index.js --why",
     "backtest": "node backtest.js --grid",
     "backtest-stocks": "node backtest.js --stocks --grid",
+    "backtest-compare": "node backtest.js --compare --days 180",
     "test": "node --test test/*.test.js"
   },
   "engines": {

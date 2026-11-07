@@ -156,7 +156,9 @@ export default {
   trade: {
     enabled: bool(env.TRADE, false),
     mode: (env.TRADE_MODE || 'demo').toLowerCase(),  // demo — демо-счёт, live — настоящие деньги, testnet
-    entry: (env.TRADE_ENTRY || 'zone').toLowerCase(), // zone — входить, когда цена в зоне входа; signal — сразу по сигналу
+    // retest (по умолчанию; zone — то же самое) — вход на ретесте: цена вернулась к уровню, и 15-минутная свеча
+    // подтвердила отскок; touch — как в 2.7: сразу при касании зоны; signal — сразу по сигналу, где бы ни была цена
+    entry: ((v) => (v === 'zone' ? 'retest' : v))((env.TRADE_ENTRY || 'retest').toLowerCase()),
     apiKey: env.BYBIT_API_KEY || '',
     apiSecret: env.BYBIT_API_SECRET || '',
     baseUrl: env.BYBIT_URL || '',                     // по умолчанию — по режиму

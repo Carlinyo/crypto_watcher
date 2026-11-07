@@ -51,6 +51,7 @@ const { Trader, MODE_RU } = await import('./lib/trader.js');
 const { writeJsonAtomic, readJson } = await import('./lib/storage.js');
 const { InstanceLock } = await import('./lib/lock.js');
 const { priceInZone, zoneOf, signalEmail, resultProblem, zoneEntry, RETRY_CODES, TRADE_EVENT_CATEGORY, EMAIL_EVENT_NAMES } = await import('./lib/policy.js');
+const { retestStep, retestEntry, levelText, levelStr, M15 } = await import('./lib/entry.js');
 const { Decisions, diagnose, reasonKey, DECISION_KINDS } = await import('./lib/decisions.js');
 const { loadStocks, stocksEnabled, stockSessionOpen, nextSessionOpen, sessionReason, stockZoneUntil, SESSION_RU, STOCK_CANDIDATES, tradedOnly, lastTradeTime } = await import('./lib/stocks.js');
 const { chartPng, chartSvg } = await import('./lib/chart.js');
@@ -152,7 +153,7 @@ if (showWhy) {
     console.log('');
   }
   const trading = s?.trading ?? { ...tradingInfo(), problem: 'программа не запущена' };
-  const zones = Object.entries(saved.zones ?? {}).map(([symbol, z]) => ({ symbol, ...z }));
+  const zones = Object.entries(saved.zones ?? {}).map(([symbol, z]) => ({ symbol, ...z, retest: cfg.trade.entry === 'retest' && !!z.level }));
   if (zones.length) {
     // текущие цены — чтобы показать, далеко ли до зон
     try {
@@ -490,6 +491,15 @@ function checkReversal(r) {
 
 const ACT_RU = { BUY: 'ПОКУПКА', SELL: 'ПРОДАЖА' };
 const zoneTxt = (p) => `${fmt(p.zone[0])}–${fmt(p.zone[1])}`;
+// вход на ретесте (TRADE_ENTRY=retest): ждём цену у уровня и подтверждение, а не входим вдогонку
+const retestOn = (z) => cfg.trade.entry === 'retest' && !!z?.level;
+const levelTxt = (L) => levelStr(L);
+function waitText(r, atLevel) {
+  const p = r.plan, base = `сигнал ${ACT_RU[p.dir]} подтверждён (оценка ${sgn(r.score)})`;
+  if (!retestOn(p)) return `${base}, цена ${fmt(r.price)} ещё не в зоне ${zoneTxt(p)} — жду`;
+  return atLevel ? `${base}, цена ${fmt(r.price)} у уровня ${levelTxt(p.level)} — жду подтверждения ретеста (закрытия 15-минутной свечи ${p.dir === 'BUY' ? 'вверх' : 'вниз'} от уровня)`
+    : `${base} — вдогонку не вхожу (цена ${fmt(r.price)}), жду ретест: ${levelText(p.level, p.dir)}`;
+}
 function note(sym, kind, why, { dir = null, key = null, merge = true } = {}) {
   decisions.add({ sym, kind, dir, why, key }, { merge });
   saveState();
@@ -564,9 +574,12 @@ async function handleResult(r, { zone = false } = {}) {
     if (st?.action === r.action && fresh && (!zone || (st.notified !== false && st.inZone !== false))) return;
     // по монете уже открыта сделка в эту сторону — повторный сигнал ничего не добавит
     if (hasTrade(sym, r.action)) { if (state.zones[sym]) dropZone(sym, 'по монете уже открыта сделка в эту сторону', { log: false }); return; }
-    const inZone = zone || priceInZone(zoneOf(r), r.price);
-    // автоторговля: по умолчанию — когда цена в зоне входа (TRADE_ENTRY=zone), иначе сразу по сигналу
-    const tradeNow = cfg.trade.entry === 'signal' || inZone;
+    // точка входа: retest (по умолчанию) — уровень удержался, подтверждение приходит из zoneTrigger (zone=true);
+    // touch — цена в зоне входа; signal — сделка сразу по сигналу, где бы ни была цена
+    const mode = cfg.trade.entry;
+    const atLevel = priceInZone(zoneOf(r), r.price);
+    const inZone = zone || (mode !== 'retest' && atLevel);
+    const tradeNow = mode === 'signal' || inZone;
     const tradeKind = r.kind !== 'stock' || cfg.trade.stocks; // акции — только при TRADE_STOCKS=1
     r.exec = !tradeNow ? null : trader.enabled && tradeKind ? await trader.onSignal(r, { zone }) : tradingOff(r);
     if (r.exec) console.log(`🤖 Bybit: ${r.exec.status === 'opened' ? `открыт ${r.exec.trade.side === 'Buy' ? 'лонг' : 'шорт'} ${coinOf(sym)} на ${fmtMoney(r.exec.trade.notional)}` : `без сделки — ${r.exec.reason}`}`);
@@ -577,17 +590,21 @@ async function handleResult(r, { zone = false } = {}) {
 
     if (opened) delete state.zones[sym];
     else if (!inZone) {
-      // цена ещё не в зоне входа — ждём её: письмо, SMS и сделка — когда цена войдёт в зону и анализ подтвердит вход
-      armZone(r, { setup: true });
-      note(sym, 'wait', `сигнал ${ACT_RU[r.action]} подтверждён (оценка ${sgn(r.score)}), цена ${fmt(r.price)} ещё не в зоне ${zoneTxt(r.plan)} — жду`, { dir: r.action, key: 'wait' });
+      // точки входа ещё нет — ждём: при входе на ретесте — цену у уровня и подтверждение, иначе — цену в зоне;
+      // письмо, SMS и сделка — в этот момент, если свежий анализ подтвердит вход
+      armZone(r, { setup: true, touched: retestOn(r.plan) && atLevel });
+      note(sym, 'wait', waitText(r, atLevel), { dir: r.action, key: 'wait' });
     } else if (trader.enabled && RETRY_CODES.has(r.exec?.code)) keepForRetry(r, now);
     else delete state.zones[sym];
-    if (inZone && !r.exec) note(sym, 'signal', `цена ${fmt(r.price)} в зоне ${zoneTxt(r.plan)}${send ? ' — письмо отправлено' : ''}`, { dir: r.action, key: 'signal' });
+    if (inZone && !r.exec) note(sym, 'signal', `${r.retest ? `ретест уровня ${levelTxt(r.retest.level)} удержался, цена ${fmt(r.price)}` : `цена ${fmt(r.price)} в зоне ${zoneTxt(r.plan)}`}${send ? ' — письмо отправлено' : ''}`, { dir: r.action, key: 'signal' });
 
     if (!send && !opened) {
       saveState();
       if (inZone) logAlert(R.signalSubject(r, { zone }), false);
-      else {
+      else if (retestOn(r.plan)) {
+        logAlert(`${R.signalSubject(r)} — жду ретест уровня ${levelTxt(r.plan.level)}`, false);
+        console.log(`⏳ ${coinOf(sym)}: ${r.action === 'BUY' ? 'покупка' : 'продажа'} — вдогонку не вхожу (цена ${fmt(r.price)}), жду ретест уровня ${levelTxt(r.plan.level)}; письмо придёт, когда уровень удержится`);
+      } else {
         logAlert(`${R.signalSubject(r)} — жду цену в зоне ${zoneTxt(r.plan)}`, false);
         console.log(`⏳ ${coinOf(sym)}: ${r.action === 'BUY' ? 'покупка' : 'продажа'}, но цена ${fmt(r.price)} ещё не в зоне ${zoneTxt(r.plan)} — письмо придёт, когда войдёт`);
       }
@@ -612,7 +629,9 @@ async function handleResult(r, { zone = false } = {}) {
   const base = r.action.replace('WATCH_', '');
   if (!r.zoneOk) {
     if (r.setup && confirmed) note(sym, 'filtered', r.reason, { dir: base, key: 'no-room' });
-    if (state.zones[sym]) dropZone(sym, 'даже от зоны входа прибыль/риск мал — хорошей точки входа нет');
+    // идёт ретест уровня — его решит подтверждение по свежему анализу, а не план от другого уровня
+    const zr = state.zones[sym];
+    if (zr && !(zr.touchedAt && retestOn(zr) && zr.dir === base)) dropZone(sym, 'даже от зоны входа прибыль/риск мал — хорошей точки входа нет');
     return;
   }
   // в эту сторону по монете уже действуем (сигнал только что был или сделка открыта) — новую зону не ждём
@@ -620,8 +639,9 @@ async function handleResult(r, { zone = false } = {}) {
   const prev = state.zones[sym];
   const setup = !!r.setup && confirmed; // сильный подтверждённый сигнал, которому не хватает только хорошей цены
   armZone(r, { setup });
-  if (setup && !(prev?.dir === base && prev.setup)) note(sym, 'wait', `сигнал ${ACT_RU[base]} подтверждён (оценка ${sgn(r.score)}), но от текущей цены ${fmt(r.price)} прибыль/риск мал — жду цену в зоне ${zoneTxt(r.plan)}`, { dir: base, key: 'wait' });
-  else if (!setup && prev?.dir !== base) note(sym, 'watch', `оценка ${sgn(r.score)} (порог ±${r.threshold.toFixed(2)}) — жду цену в зоне ${zoneTxt(r.plan)}`, { dir: base, key: 'watch' });
+  const where = retestOn(r.plan) ? `ретест уровня ${levelTxt(r.plan.level)}` : `цену в зоне ${zoneTxt(r.plan)}`;
+  if (setup && !(prev?.dir === base && prev.setup)) note(sym, 'wait', `сигнал ${ACT_RU[base]} подтверждён (оценка ${sgn(r.score)}), но от текущей цены ${fmt(r.price)} прибыль/риск мал — жду ${where}`, { dir: base, key: 'wait' });
+  else if (!setup && prev?.dir !== base) note(sym, 'watch', `оценка ${sgn(r.score)} (порог ±${r.threshold.toFixed(2)}) — жду ${where}`, { dir: base, key: 'watch' });
   if (st && (st.action === r.action || st.action === base) && now - st.at < cfg.signal.watchCooldownMinutes * 60e3) { saveState(); return; }
   const subject = R.signalSubject(r);
   logAlert(subject, wants('watch'));
@@ -647,12 +667,22 @@ function marketClosed(c, b) {
 
 // зона входа, которую ждём: как только цена в неё войдёт — свежий анализ, и если он подтвердит вход — письмо и сделка.
 // setup — зона после подтверждённого сильного сигнала (для панели и разбора; правило входа то же)
-function armZone(r, { setup = false } = {}) {
+function armZone(r, { setup = false, touched = false } = {}) {
   const now = Date.now(), p = r.plan;
   const prev = state.zones[r.symbol];
   const same = prev?.dir === p.dir;
+  // идёт ретест (цена у уровня): уровень и касание не меняются при каждом пересчёте — иначе подтверждение
+  // откладывалось бы; ретест заканчивается подтверждением, провалом уровня, уходом цены, стопом или сроком
+  if (same && prev.touchedAt && prev.level && retestOn(prev)) { prev.setup ||= setup; return; }
+  const level = p.level ? { low: p.level.low, high: p.level.high, role: p.level.role, brokeAt: p.level.brokeAt ?? null, volRatio: p.level.volRatio ?? null, sources: (p.level.sources ?? []).slice(0, 3) } : null;
+  // план обновился, а уровень тот же — касание и экстремум ретеста не теряются
+  const keep = same && prev.touchedAt && level && prev.level && level.low <= prev.level.high && level.high >= prev.level.low;
   state.zones[r.symbol] = {
     dir: p.dir, low: p.zone[0], high: p.zone[1], atr: r.stats.atr, stop: p.stop, t1: p.t1, t2: p.t2,
+    level, entryType: p.entryType ?? null,
+    touchedAt: keep ? prev.touchedAt : touched ? now : null,
+    touchExt: keep ? prev.touchExt : touched ? r.price : null,
+    checked15: keep ? prev.checked15 : touched ? Math.floor(now / M15) : null,
     at: same ? prev.at ?? now : now,
     // у акции зона живёт до конца следующего торгового дня — выходные и праздники её не съедают
     until: same && prev.notifiedAt ? prev.until : r.kind === 'stock' ? stockZoneUntil(now, cfg.signal.zoneValidHours) : now + cfg.signal.zoneValidHours * 3600e3,
@@ -764,15 +794,50 @@ async function onWhale(ev, decision) {
 
 // ── живые проверки: зоны входа и журнал (каждые 5 с) ───────────────────────
 const triggering = new Set();
+// свежие 15-минутные свечи для подтверждения ретеста: кэш — секунды, нужна только что закрывшаяся свеча
+async function recent15(c) {
+  if (c.kind === 'stock') return tradedOnly(await binance.klines(perpOf(c).symbol, '15m', 16, { market: 'futures', ttlMs: 3e3 }));
+  return binance.klines(c.symbol, '15m', 16, { ttlMs: 3e3 });
+}
+
 async function zoneTrigger(sym, z) {
   const c = coins.find((x) => x.symbol === sym);
   if (!c) return;
+  const retest = retestOn(z);
+  if (retest && !z.touchedAt) return; // при входе на ретесте проверка — только после касания уровня
   const b = await gather(c);
   if (b.closed) return; // торги по акции закрылись
   const r = analyze(b, cfg);
   results.set(sym, r);
   if (state.zones[sym] !== z) return; // пока шёл анализ, зону сняли или заменили
-  const res = zoneEntry(z, r, { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio });
+  const rule = { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio };
+  if (retest) {
+    // уровень удержался? — последняя закрытая 15-минутная свеча; зона — та, которую ждали, стоп — за экстремумом ретеста
+    const m15 = await recent15(c).catch(() => b.candles.m15);
+    if (state.zones[sym] !== z) return;
+    const d = retestEntry(z, r, { m15, h1: b.candles.h1, risk: cfg.risk, ...rule });
+    if (d.conf?.ext != null) z.touchExt = d.conf.ext;
+    console.log(`🎯 ${coinOf(sym)}: ретест уровня ${levelTxt(z.level)} — ${d.kind === 'entry' ? `вход подтверждён: ${d.why}` : d.why}`);
+    if (d.kind === 'fail') { dropZone(sym, d.why); return; }
+    if (d.kind === 'wait' || d.kind === 'away') {
+      note(sym, 'retest', d.why, { dir: z.dir, key: d.kind === 'away' ? 'retest-away' : d.conf?.below ? 'retest-below' : 'retest-wait' });
+      if (d.kind === 'away') Object.assign(z, { touchedAt: null, touchExt: null, checked15: null }); // ждём нового касания
+      saveState();
+      return;
+    }
+    if (d.kind === 'no') {
+      note(sym, 'zone-no', `ретест подтвердился, но ${d.why}`, { dir: z.dir, key: d.code === 'veto' ? reasonKey(d.why) : d.code });
+      if (d.flip) dropZone(sym, 'картина развернулась против входа');
+      saveState();
+      return;
+    }
+    r.plan = d.plan;
+    r.retest = d.retest;
+    r.action = z.dir;
+    await handleResult(r, { zone: true });
+    return;
+  }
+  const res = zoneEntry(z, r, rule);
   console.log(`🎯 ${coinOf(sym)}: цена ${fmt(r.price)} в зоне ${fmt(z.low)}–${fmt(z.high)} — ${res.ok ? 'вход подтверждён' : `вход не подтверждён: ${res.why}`}`);
   if (!res.ok) {
     note(sym, 'zone-no', res.why, { dir: z.dir, key: res.code === 'veto' ? reasonKey(res.why) : res.code });
@@ -783,21 +848,44 @@ async function zoneTrigger(sym, z) {
   await handleResult(r, { zone: true });
 }
 
+// вход на ретесте: касание уровня → проверка после закрытия каждой 15-минутной свечи → вход, когда уровень удержался
+function retestTick(sym, z, tick) {
+  const step = retestStep(z, tick), L = z.level;
+  if (step === 'touch') {
+    saveState();
+    console.log(`🎯 ${coinOf(sym)}: цена ${fmt(z.touchExt)} дошла до уровня ${levelTxt(L)} — жду подтверждения ретеста`);
+    note(sym, 'retest', `цена дошла до уровня: ${levelText(L, z.dir)} — жду подтверждения: закрытия 15-минутной свечи ${z.dir === 'BUY' ? 'вверх' : 'вниз'} от уровня`, { dir: z.dir, key: 'retest-touch' });
+  } else if (step === 'away') {
+    saveState();
+    note(sym, 'retest', `цена ушла от уровня ${levelTxt(L)} без подтверждения — вдогонку не вхожу, жду нового ретеста`, { dir: z.dir, key: 'retest-away' });
+  } else if (step === 'check') {
+    triggering.add(sym);
+    zoneTrigger(sym, z).catch((e) => console.error(`🎯 ${sym}: ${e.message}`)).finally(() => triggering.delete(sym));
+  }
+}
+
 function liveTick() {
   const now = Date.now();
   for (const [sym, z] of Object.entries(state.zones)) {
     if (now > z.until) { dropZone(sym, z.notifiedAt ? 'время повторных попыток вышло' : `цена не дошла до зоны за ${cfg.signal.zoneValidHours} ч`); continue; }
+    // зона из прошлой версии (без уровня для ретеста) — её пересчитает следующий анализ по новым правилам входа
+    if (cfg.trade.entry === 'retest' && !z.level && !z.notifiedAt) { dropZone(sym, 'зона из прошлой версии — пересчитываю по правилам входа на ретесте', { log: false }); continue; }
     const rr = results.get(sym);
     const lp = flow.lastPrice(sym) ?? (rr ? { price: rr.price, time: rr.time } : null);
     const maxAge = streamsOn ? 60e3 : cfg.pollSeconds * 3000;
     if (!lp || now - lp.time > maxAge || triggering.has(sym)) continue;
     if (isStock(sym) && !stockSessionOpen(cfg.stocks.hours)) continue; // по акциям вход — только в часы торгов
+    // максимум и минимум цены с прошлой проверки — чтобы не пропустить касание уровня и экстремум ретеста
+    const rg = flow.takeRange(sym, 'zone');
+    const lo = Math.min(lp.price, rg?.lo ?? Infinity), hi = Math.max(lp.price, rg?.hi ?? -Infinity);
     // цена прошла сквозь зону за стоп — зона пробита, ждать её больше нечего
-    if (z.stop && (z.dir === 'BUY' ? lp.price < z.stop : lp.price > z.stop)) {
-      console.log(`⏹ ${coinOf(sym)}: цена ${fmt(lp.price)} ушла за стоп ${fmt(z.stop)} — зона ${fmt(z.low)}–${fmt(z.high)} больше не актуальна`);
-      dropZone(sym, `цена ${fmt(lp.price)} ушла за стоп ${fmt(z.stop)}`);
+    if (z.stop && (z.dir === 'BUY' ? lo < z.stop : hi > z.stop)) {
+      const px = z.dir === 'BUY' ? lo : hi;
+      console.log(`⏹ ${coinOf(sym)}: цена ${fmt(px)} ушла за стоп ${fmt(z.stop)} — зона ${fmt(z.low)}–${fmt(z.high)} больше не актуальна`);
+      dropZone(sym, `цена ${fmt(px)} ушла за стоп ${fmt(z.stop)}`);
       continue;
     }
+    if (retestOn(z)) { retestTick(sym, z, { now, price: lp.price, lo, hi }); continue; }
     if (!priceInZone(z, lp.price)) continue;
     // повторная проверка — через 10 минут, или раньше, если цена зашла глубже в зону (вход стал выгоднее)
     const deeper = z.lastTriggerPrice && (z.dir === 'BUY' ? lp.price <= z.lastTriggerPrice - 0.25 * z.atr : lp.price >= z.lastTriggerPrice + 0.25 * z.atr);
@@ -910,7 +998,7 @@ const feedsSummary = () => {
 };
 
 const stocksStatus = () => ({ on: coins.some((c) => c.kind === 'stock'), n: coins.filter((c) => c.kind === 'stock').length, hours: cfg.stocks.hours, trade: cfg.trade.stocks });
-const zonesNow = () => Object.entries(state.zones).map(([symbol, z]) => ({ symbol, ...z, price: flow.lastPrice(symbol)?.price ?? results.get(symbol)?.price ?? null }));
+const zonesNow = () => Object.entries(state.zones).map(([symbol, z]) => ({ symbol, ...z, retest: retestOn(z), price: flow.lastPrice(symbol)?.price ?? results.get(symbol)?.price ?? null }));
 
 const app = {
   results,
@@ -935,7 +1023,7 @@ const app = {
     zones: zonesNow(),
     emailEvents: cfg.notify.events.map((x) => EMAIL_EVENT_NAMES[x] ?? x),
     why: diagnose({ trading: tradingInfo(), list: decisions.list, zones: zonesNow(), confirmPolls: cfg.signal.confirmPolls, stocks: stocksStatus() }),
-    entryRule: { ratio: cfg.signal.zoneTriggerRatio, minRR: cfg.signal.minRiskReward },
+    entryRule: { ratio: cfg.signal.zoneTriggerRatio, minRR: cfg.signal.minRiskReward, mode: cfg.trade.entry },
     breadth: { ...breadth },
     options: Object.fromEntries(['BTC', 'ETH'].map((c) => [c, results.get(`${c}USDT`)?.options ?? null]).filter(([, v]) => v)),
     decisions: decisions.recent(40),

@@ -6,7 +6,7 @@ import cfg from '../config.js';
 
 test('Письма по умолчанию: цена в зоне, сделки, киты, сбои', () => {
   assert.deepEqual(cfg.notify.events, DEFAULT_EMAIL_EVENTS);
-  assert.equal(cfg.trade.entry, 'zone');
+  assert.equal(cfg.trade.entry, 'retest', 'по умолчанию — вход на ретесте');
 });
 
 test('Цена в зоне входа: покупка — у зоны или ниже (но не провал), продажа — зеркально', () => {

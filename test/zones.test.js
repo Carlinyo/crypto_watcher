@@ -89,7 +89,7 @@ test('Журнал решений: повтор за час — та же стр
   assert.equal(big.list[0].sym, 'C8USDT');
 });
 
-const tradingOk = { wanted: true, hasKeys: true, ready: true, mode: 'demo', balance: 10000, entry: 'zone', open: 0, maxPositions: 3, configErrors: [] };
+const tradingOk = { wanted: true, hasKeys: true, ready: true, mode: 'demo', balance: 10000, entry: 'retest', open: 0, maxPositions: 3, configErrors: [] };
 
 test('Почему нет сделок: автоторговля выключена или Bybit не подключён — это первая строка', () => {
   const off = diagnose({ trading: { wanted: false, hasKeys: true } });
@@ -122,7 +122,7 @@ test('Почему нет сделок: сигналов не было, их о�
 
   d.add({ sym: 'SOLUSDT', kind: 'wait', why: 'сигнал ПОКУПКА подтверждён, цена ещё не в зоне', key: 'wait' }, { now });
   const far = diagnose({ trading: tradingOk, list: d.list, now, zones: [{ symbol: 'SOLUSDT', dir: 'BUY', low: 148.5, high: 149.8, price: 152.1, setup: true }] });
-  assert.ok(far.lines.some((l) => /ни разу не дошла до зон входа.*TRADE_ENTRY=signal/.test(l.text)));
+  assert.ok(far.lines.some((l) => /ни разу не дошла до уровней входа.*не покупает «вдогонку» на пробое.*--compare/.test(l.text)));
   assert.ok(far.lines.some((l) => /SOL покупка 148\.50–149\.80, сильный сигнал \(цена 152\.10, до зоны −1\.5%\)/.test(l.text)));
   // расстояние до зоны: цена внутри — «в зоне», для продажи цене нужно подняться
   assert.equal(zoneDistance({ dir: 'SELL', low: 164.49, high: 166.76, price: 165.61 }), 'в зоне');
