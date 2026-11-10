@@ -165,8 +165,11 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
     if (open && j >= open.entryIdx) {
       const buy = open.side === 'BUY';
       const fav = buy ? bar.high : bar.low, adv = buy ? bar.low : bar.high;
-      if (buy ? adv <= open.stop : adv >= open.stop) close(j, open.stop, open.trailed ? 'trail' : open.tp1 ? 'breakeven' : 'stop');
+      if (buy ? adv <= open.stop : adv >= open.stop) close(j, open.stop, open.trailed ? 'trail' : open.tp1 ? 'breakeven' : open.be ? 'be' : 'stop');
       else {
+        // прибыль в один риск (TRADE_BE_AT_R) — стоп в безубыток ещё до цели 1, как у работающей программы
+        const beR = cfg.trade.beAtR * Math.abs(open.entry - open.initStop);
+        if (!open.tp1 && !open.be && beR > 0 && (buy ? fav >= open.entry + beR : fav <= open.entry - beR)) { open.be = true; open.stop = open.entry; }
         if (!open.tp1 && (buy ? fav >= open.t1 : fav <= open.t1)) { open.tp1 = true; open.stop = open.entry; }
         if (open && open.tp1 && (buy ? fav >= open.t2 : fav <= open.t2)) close(j, open.t2, 'tp2');
         else if (open && open.tp1 && !open.trailed && (buy ? fav >= (open.t1 + open.t2) / 2 : fav <= (open.t1 + open.t2) / 2)) { open.trailed = true; open.stop = open.t1; }
@@ -266,7 +269,7 @@ const pf = (x) => (x == null ? '—' : x === Infinity ? '∞' : x.toFixed(2));
 const perDay = (n) => (n / days < 0.1 ? (n / days).toFixed(2) : (n / days).toFixed(1));
 const row = (name, s) => `${name.padEnd(12)}${pad(s.n, 7)}${pad(perDay(s.n), 8)}${pad(s.winRate == null ? '—' : `${(s.winRate * 100).toFixed(0)}%`, 8)}${pad(s.tp1 == null ? '—' : `${(s.tp1 * 100).toFixed(0)}%`, 8)}${pad(s.avgR == null ? '—' : s.avgR.toFixed(2), 8)}${pad(s.sumR.toFixed(1), 9)}${pad(pf(s.pf), 7)}${pad(s.maxDD.toFixed(1), 10)}`;
 const HEAD = `${'монета'.padEnd(12)}${pad('сделок', 7)}${pad('в день', 8)}${pad('успех', 8)}${pad('цель1', 8)}${pad('ср. R', 8)}${pad('сумма R', 9)}${pad('PF', 7)}${pad('просадка', 10)}`;
-const WHY_RU = { stop: 'стоп', breakeven: 'цель 1 → безубыток', trail: 'цель 1 → подтянутый стоп', tp2: 'цель 2', expired: 'истекло время', reversed: 'обратный сигнал' };
+const WHY_RU = { stop: 'стоп', breakeven: 'цель 1 → безубыток', be: 'безубыток до цели 1', trail: 'цель 1 → подтянутый стоп', tp2: 'цель 2', expired: 'истекло время', reversed: 'обратный сигнал' };
 const REG_RU = { trend_up: 'восх. тренд', trend_down: 'нисх. тренд', range: 'боковик', squeeze: 'сжатие', volatile: 'волатильно', transition: 'переходный' };
 
 // ── прогон ────────────────────────────────────────────────────────────────

@@ -177,6 +177,16 @@ export default {
     slTriggerBy: env.TRADE_SL_TRIGGER || 'LastPrice', // по какой цене срабатывает стоп: LastPrice или MarkPrice
     maxPerDay: num(env.TRADE_MAX_PER_DAY, 10),       // не больше сделок за день (защита от сбоя, который открывал бы сделку за сделкой)
     allowAnyIp: bool(env.TRADE_ALLOW_ANY_IP, false),  // реальный счёт с ключом без привязки к IP — только если явно разрешено
+    // ── защита капитала (0 — выключить правило) ──
+    maxOpenRiskPct: num(env.TRADE_MAX_OPEN_RISK_PCT, 4),   // суммарный риск всех открытых сделок, % баланса
+    maxSameSide: num(env.TRADE_MAX_SAME_SIDE, 2),          // не больше сделок в одну сторону (монеты ходят вместе)
+    lossStreakPause: num(env.TRADE_LOSS_STREAK, 3),        // столько убыточных сделок подряд — пауза
+    lossPauseHours: num(env.TRADE_LOSS_PAUSE_HOURS, 12),   // на сколько часов пауза после серии убытков
+    weeklyLossPct: num(env.TRADE_WEEKLY_LOSS_PCT, 10),     // убыток за 7 дней, % баланса — новых сделок нет
+    maxDrawdownPct: num(env.TRADE_MAX_DRAWDOWN_PCT, 15),   // просадка от максимума баланса — полная остановка до --resume-trading
+    cooldownHours: num(env.TRADE_COOLDOWN_HOURS, 6),       // после убытка по монете — столько часов по ней не входить
+    beAtR: num(env.TRADE_BE_AT_R, 1),                      // прибыль в столько рисков — стоп в безубыток (ещё до цели 1)
+    volRiskMult: num(env.TRADE_VOL_RISK_MULT, 0.5),        // множитель риска при высокой волатильности рынка
     stocks: bool(env.TRADE_STOCKS, false),            // открывать сделки и по акциям (фьючерсы на акции Bybit) — по умолчанию нет
     tickSeconds: 10,
   },
