@@ -1,8 +1,11 @@
 // Все настройки в одном месте. Значения можно переопределить переменными окружения (.env).
 const env = process.env;
-const num = (v, d) => (v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v));
-const bool = (v, d) => (v === undefined || v === '' ? d : !['0', 'false', 'no', 'off'].includes(String(v).toLowerCase()));
-const list = (v, d) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : d);
+// пояснение в конце строки («TRADE=1   # включить») обычно убирает сама программа запуска; если не убрала
+// (docker run --env-file), убираем здесь — иначе «0   # выключить» читалось бы как «включено»
+const clean = (v) => (typeof v === 'string' ? v.replace(/(^|\s)#.*$/, '').trim() : v);
+const num = (v, d) => { v = clean(v); return v === undefined || v === '' || Number.isNaN(Number(v)) ? d : Number(v); };
+const bool = (v, d) => { v = clean(v); return v === undefined || v === '' ? d : !['0', 'false', 'no', 'off'].includes(String(v).toLowerCase()); };
+const list = (v, d) => { v = clean(v); return v ? v.split(',').map((s) => s.trim()).filter(Boolean) : d; };
 
 export default {
   // 'auto' — топ монет по капитализации и объёму; или свой список: BTCUSDT,ETHUSDT
@@ -26,7 +29,7 @@ export default {
     list: list(env.STOCKS, ['auto']),
     size: num(env.STOCKS_TOP, 15),
     // когда по акциям приходят сигналы: regular — основная сессия 9:30–16:00 по Нью-Йорку; extended — 4:00–20:00; any — всегда, когда идут торги
-    hours: (env.STOCK_HOURS || 'regular').toLowerCase(),
+    hours: (clean(env.STOCK_HOURS) || 'regular').toLowerCase(),
     index: list(env.STOCK_INDEX, ['QQQ', 'SPY']),     // фон рынка акций (вместо биткоина у альткоинов): первый из доступных
     closedMinutes: 30,                                // по контракту нет сделок столько минут — торги закрыты
     candles: { m15: 1000, h1: 1500, h4: 1000, d1: 500 }, // больше истории: часы без торгов из неё выбрасываются
@@ -155,10 +158,10 @@ export default {
   // 🤖 автоторговля на Bybit (USDT-фьючерсы) по сигналам ПОКУПКА / ПРОДАЖА
   trade: {
     enabled: bool(env.TRADE, false),
-    mode: (env.TRADE_MODE || 'demo').toLowerCase(),  // demo — демо-счёт, live — настоящие деньги, testnet
+    mode: (clean(env.TRADE_MODE) || 'demo').toLowerCase(),  // demo — демо-счёт, live — настоящие деньги, testnet
     // retest (по умолчанию; zone — то же самое) — вход на ретесте: цена вернулась к уровню, и 15-минутная свеча
     // подтвердила отскок; touch — как в 2.7: сразу при касании зоны; signal — сразу по сигналу, где бы ни была цена
-    entry: ((v) => (v === 'zone' ? 'retest' : v))((env.TRADE_ENTRY || 'retest').toLowerCase()),
+    entry: ((v) => (v === 'zone' ? 'retest' : v))((clean(env.TRADE_ENTRY) || 'retest').toLowerCase()),
     apiKey: env.BYBIT_API_KEY || '',
     apiSecret: env.BYBIT_API_SECRET || '',
     baseUrl: env.BYBIT_URL || '',                     // по умолчанию — по режиму
@@ -174,7 +177,7 @@ export default {
     symbols: list(env.TRADE_SYMBOLS, []),             // только эти монеты (пусто — все отслеживаемые)
     tp1Share: 0.5,                                    // доля позиции, которая закрывается на цели 1
     feePct: num(env.TRADE_FEE_PCT, 0.055),            // комиссия тейкера Bybit, % (учитывается в размере позиции)
-    slTriggerBy: env.TRADE_SL_TRIGGER || 'LastPrice', // по какой цене срабатывает стоп: LastPrice или MarkPrice
+    slTriggerBy: clean(env.TRADE_SL_TRIGGER) || 'LastPrice', // по какой цене срабатывает стоп: LastPrice или MarkPrice
     maxPerDay: num(env.TRADE_MAX_PER_DAY, 10),       // не больше сделок за день (защита от сбоя, который открывал бы сделку за сделкой)
     allowAnyIp: bool(env.TRADE_ALLOW_ANY_IP, false),  // реальный счёт с ключом без привязки к IP — только если явно разрешено
     // ── защита капитала (0 — выключить правило) ──
@@ -187,6 +190,8 @@ export default {
     cooldownHours: num(env.TRADE_COOLDOWN_HOURS, 6),       // после убытка по монете — столько часов по ней не входить
     beAtR: num(env.TRADE_BE_AT_R, 1),                      // прибыль в столько рисков — стоп в безубыток (ещё до цели 1)
     volRiskMult: num(env.TRADE_VOL_RISK_MULT, 0.5),        // множитель риска при высокой волатильности рынка
+    exitOnReversal: bool(env.TRADE_EXIT_ON_REVERSAL, true), // подтверждённый сигнал против открытой сделки — закрыть её, не дожидаясь стопа
+    maxSpreadPct: num(env.TRADE_MAX_SPREAD, 0.15),         // разница цен покупки и продажи на Bybit больше — не входить (0 — не проверять)
     stocks: bool(env.TRADE_STOCKS, false),            // открывать сделки и по акциям (фьючерсы на акции Bybit) — по умолчанию нет
     tickSeconds: 10,
   },
@@ -200,6 +205,17 @@ export default {
   },
 
   digest: { enabled: bool(env.DIGEST, true), hour: num(env.DIGEST_HOUR, 9) },
+
+  // самопроверка: раз в неделю программа сама прогоняет бэктест на свежей истории (отдельным процессом) и показывает итог
+  // в панели; если стратегия на истории в минусе — предупреждает и (SELF_TEST_GUARD) вдвое уменьшает риск сделок
+  selftest: {
+    enabled: bool(env.SELF_TEST, true),
+    days: num(env.SELF_TEST_DAYS, 60),
+    everyDays: num(env.SELF_TEST_EVERY_DAYS, 7),
+    step: 2,
+    guard: bool(env.SELF_TEST_GUARD, true),
+    file: 'data/selftest.json',
+  },
 
   // веб-панель: по умолчанию только с самого сервера. DASHBOARD_LOCAL_ONLY=1 — порт и так закрыт снаружи (как в docker-compose.yml)
   server: { port: num(env.PORT, 8080), host: env.HOST || '127.0.0.1', token: env.DASHBOARD_TOKEN || '', localOnly: bool(env.DASHBOARD_LOCAL_ONLY, false) },

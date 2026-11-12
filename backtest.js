@@ -8,6 +8,7 @@
 //   флаги: --days N  --step K (анализ раз в K часов)  --fast (без 15m)  --threshold X
 //          --entry retest|touch|signal (как TRADE_ENTRY: на ретесте уровня, при касании зоны — как в 2.7, сразу по сигналу)
 //   node backtest.js --compare                — три способа входа рядом на одних и тех же данных
+//   флаги: --json файл (итог в файл — для самопроверки программы)  --quiet (без хода загрузки, низкий приоритет)
 //   node backtest.js --stocks                 — акции из списка программы (фьючерсы на акции Binance)
 //   node backtest.js NVDAUSDT AAPLUSDT        — свои акции: фьючерс на акцию распознаётся сам
 //
@@ -28,6 +29,8 @@ const { fmt } = await import('./lib/format.js');
 const { priceInZone, zoneEntry } = await import('./lib/policy.js');
 const { touches, isConfirmation, retestPlan } = await import('./lib/entry.js');
 const { STOCK_CANDIDATES, tradedOnly } = await import('./lib/stocks.js');
+const { simulateAccount, accountText } = await import('./lib/portfolio.js');
+const os = await import('node:os');
 const { MacroCalendar } = await import('./lib/calendar.js');
 const calendar = new MacroCalendar(path.join(dir, cfg.macro.file));
 
@@ -42,6 +45,15 @@ const ENTRY_MODES = { retest: 'на ретесте уровня', touch: 'при
 const entryMode = ((v) => (v === 'zone' ? 'retest' : ENTRY_MODES[v] ? v : 'retest'))(String(flag('entry', cfg.trade.entry)).toLowerCase());
 const compare = bool('compare');
 const fast = bool('fast');
+const jsonOut = flag('json', null);
+const quiet = bool('quiet');
+// самопроверка идёт рядом с работающей программой — не отнимаем у неё процессор, а если на сервере кончится память,
+// система должна остановить бэктест, а не программу (Linux: чем больше oom_score_adj, тем раньше процесс под снос)
+if (quiet) {
+  try { os.setPriority(os.constants.priority.PRIORITY_LOW); } catch { /* не разрешено — работаем как есть */ }
+  try { fs.writeFileSync('/proc/self/oom_score_adj', '1000'); } catch { /* не Linux или запрещено */ }
+}
+const say = (...a) => { if (!quiet) console.log(...a); };
 // анализ — с планом для входа на ретесте и планом как в 2.7 (b.legacyPlan), способ входа выбирает симуляция
 const acfg = { ...cfg, trade: { ...cfg.trade, entry: 'retest' } };
 const stocksMode = bool('stocks');
@@ -61,6 +73,15 @@ if (!symbols.length) {
 const isStockSym = (s) => !!binance.stockOf(s) && !binance.futuresOf(s);
 if (symbols.filter((s) => !isStockSym(s)).length > 1 && !symbols.includes('BTCUSDT')) symbols.unshift('BTCUSDT'); // контекст биткоина для альтов
 
+// кэш истории живёт 6 часов — файлы старше суток не нужны (иначе папка растёт с каждой сменой списка монет)
+try {
+  const hd = path.join(dir, 'data', 'history');
+  for (const f of fs.readdirSync(hd)) {
+    const full = path.join(hd, f);
+    if (/\.(json|tmp)$/.test(f) && Date.now() - fs.statSync(full).mtimeMs > 86400e3) fs.unlinkSync(full);
+  }
+} catch { /* папки ещё нет */ }
+
 async function history(symbol, interval, nDays, market = 'spot') {
   const file = path.join(dir, 'data', 'history', `${market === 'spot' ? '' : 'f-'}${symbol}-${interval}-${nDays}.json`);
   try {
@@ -68,8 +89,12 @@ async function history(symbol, interval, nDays, market = 'spot') {
     if (Date.now() - st.mtimeMs < 6 * H) return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch { /* нет кэша */ }
   const rows = await binance.klinesHistory(symbol, interval, Date.now() - nDays * DAY, Date.now(), market);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(rows));
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(rows));
+    fs.renameSync(tmp, file); // целиком или никак: рядом может идти второй бэктест (самопроверка и запуск вручную)
+  } catch { /* кэш не записался (нет места на диске?) — работаем без него */ }
   return rows;
 }
 
@@ -169,8 +194,8 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
       else {
         // прибыль в один риск (TRADE_BE_AT_R) — стоп в безубыток ещё до цели 1, как у работающей программы
         const beR = cfg.trade.beAtR * Math.abs(open.entry - open.initStop);
-        if (!open.tp1 && !open.be && beR > 0 && (buy ? fav >= open.entry + beR : fav <= open.entry - beR)) { open.be = true; open.stop = open.entry; }
-        if (!open.tp1 && (buy ? fav >= open.t1 : fav <= open.t1)) { open.tp1 = true; open.stop = open.entry; }
+        if (!open.tp1 && !open.be && beR > 0 && (buy ? fav >= open.entry + beR : fav <= open.entry - beR)) { open.be = true; open.stop = open.entry; open.safeIdx ??= j; }
+        if (!open.tp1 && (buy ? fav >= open.t1 : fav <= open.t1)) { open.tp1 = true; open.stop = open.entry; open.safeIdx ??= j; }
         if (open && open.tp1 && (buy ? fav >= open.t2 : fav <= open.t2)) close(j, open.t2, 'tp2');
         else if (open && open.tp1 && !open.trailed && (buy ? fav >= (open.t1 + open.t2) / 2 : fav <= (open.t1 + open.t2) / 2)) { open.trailed = true; open.stop = open.t1; }
         if (open && j - open.entryIdx >= expire) close(j, bar.close, 'expired');
@@ -233,6 +258,8 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
     const d = dec(rec), p = planOf(rec);
     if (d.action === 'BUY' || d.action === 'SELL') {
       if (open && open.side === d.action) continue;
+      // подтверждённый сигнал против открытой сделки — выход, не дожидаясь стопа (TRADE_EXIT_ON_REVERSAL)
+      if (open && !cfg.trade.exitOnReversal) continue;
       if (open) close(j, bar.close, 'reversed');
       const inZone = priceInZone({ dir: p.dir, low: p.zone[0], high: p.zone[1], atr: rec.atr }, bar.close);
       if (mode === 'signal' || (mode === 'touch' && inZone)) {
@@ -257,7 +284,7 @@ function stats(trades) {
   const sumR = trades.reduce((s, t) => s + t.r, 0);
   const gp = trades.filter((t) => t.r > 0).reduce((s, t) => s + t.r, 0), gl = -trades.filter((t) => t.r < 0).reduce((s, t) => s + t.r, 0);
   let eq = 0, peak = 0, dd = 0;
-  for (const t of [...trades].sort((a, b) => a.exitIdx - b.exitIdx)) { eq += t.r; peak = Math.max(peak, eq); dd = Math.max(dd, peak - eq); }
+  for (const t of [...trades].sort((a, b) => (a.t1 ?? a.exitIdx) - (b.t1 ?? b.exitIdx))) { eq += t.r; peak = Math.max(peak, eq); dd = Math.max(dd, peak - eq); }
   return {
     n, wins, losses, winRate: wins + losses ? wins / (wins + losses) : null, tp1: n ? trades.filter((t) => t.tp1).length / n : null,
     avgR: n ? sumR / n : null, sumR, pf: gl > 0 ? gp / gl : gp > 0 ? Infinity : null, maxDD: dd,
@@ -273,12 +300,20 @@ const WHY_RU = { stop: 'стоп', breakeven: 'цель 1 → безубыток
 const REG_RU = { trend_up: 'восх. тренд', trend_down: 'нисх. тренд', range: 'боковик', squeeze: 'сжатие', volatile: 'волатильно', transition: 'переходный' };
 
 // ── прогон ────────────────────────────────────────────────────────────────
-console.log(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr} | вход ${compare ? 'всеми тремя способами' : ENTRY_MODES[entryMode]}${fast ? ' | без 15m (подтверждение ретеста — по часовым свечам)' : ''}`);
-console.log('Загрузка истории (кэшируется в data/history)…');
-const all = new Map();
+// Каждая монета считается целиком (анализ → сделки при всех порогах и способах входа) и сразу освобождает память:
+// так бэктест укладывается в память контейнера рядом с работающей программой.
+say(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr} | вход ${compare ? 'всеми тремя способами' : ENTRY_MODES[entryMode]}${fast ? ' | без 15m (подтверждение ретеста — по часовым свечам)' : ''}`);
+say('Загрузка истории (кэшируется в data/history)…');
+const thresholds = grid ? [0.25, 0.28, 0.3, 0.33, 0.36, 0.4, 0.45, 0.5] : [baseThr];
+const CMP = [['retest', 'ретест'], ['touch', 'касание 2.7'], ['signal', 'по сигналу']];
+const runs = new Map(thresholds.map((thr) => [thr, []]));   // порог → сделки (способ входа — entryMode)
+const cmpRuns = new Map(CMP.map(([m]) => [m, []]));         // способ входа → сделки при основном пороге
+const perSym = [];                                            // [монета, сделки] при основном пороге
+const mainThr = thresholds.includes(baseThr) ? baseThr : thresholds[0];
 const btcScores = new Map();
 let btcData = null;
 const t0 = Date.now();
+const done = [];
 
 for (const sym of symbols) {
   let data;
@@ -308,108 +343,129 @@ for (const sym of symbols) {
   }
   const recs = new Map();
   const total = Math.ceil((data.h1.length - data.start) / step);
-  let done = 0, lastLog = Date.now();
+  let n = 0, lastLog = Date.now();
   for (let i = data.start; i < data.h1.length - 1; i += step) {
     const r = analyzeAt(sym, data, i, data.h1[i].close, data.btcAt);
     recs.set(i, compact(r));
     if (sym === 'BTCUSDT') btcScores.set(data.h1[i].closeTime, { score: r.score, trend: r.blocks.trend.score });
-    if (++done && Date.now() - lastLog > 5000) { lastLog = Date.now(); process.stdout.write(`  ${sym}: ${Math.round((done / total) * 100)}%\r`); }
+    if (++n && !quiet && Date.now() - lastLog > 5000) { lastLog = Date.now(); process.stdout.write(`  ${sym}: ${Math.round((n / total) * 100)}%\r`); }
   }
-  if (sym === 'BTCUSDT') btcData = data;
-  all.set(sym, { data, recs, zoneCache: new Map() });
-  console.log(`  ${sym}: проанализировано ${done} точек`);
+  // сделки с временем входа и выхода, расстоянием до стопа и моментом, когда стоп перенесён в безубыток
+  const mid = data.start + Math.floor((data.h1.length - data.start) / 2);
+  const stamp = (tr) => tr.map((t) => ({
+    ...t, kind: data.kind, t0: data.h1[t.entryIdx].time, t1: data.h1[t.exitIdx].closeTime ?? data.h1[t.exitIdx].time + H,
+    safeAt: t.safeIdx != null ? data.h1[t.safeIdx].closeTime ?? data.h1[t.safeIdx].time + H : null,
+    stopPct: Math.abs(t.entry - t.initStop) / t.entry, second: t.entryIdx >= mid,
+  }));
+  const zoneCache = new Map();
+  for (const thr of thresholds) {
+    const tr = stamp(simulate(sym, data, recs, thr, zoneCache));
+    runs.get(thr).push(...tr);
+    if (thr === mainThr) { perSym.push([sym, tr]); cmpRuns.get(entryMode).push(...tr); }
+  }
+  if (compare) for (const [m] of CMP) if (m !== entryMode) cmpRuns.get(m).push(...stamp(simulate(sym, data, recs, mainThr, zoneCache, m)));
+  if (sym === 'BTCUSDT') btcData = { h1: data.h1 }; // альтам нужен только часовой график биткоина
+  done.push(sym);
+  say(`  ${sym}: проанализировано ${n} точек`);
 }
 
-const thresholds = grid ? [0.25, 0.28, 0.3, 0.33, 0.36, 0.4, 0.45, 0.5] : [baseThr];
-const summary = [];
-for (const thr of thresholds) {
-  const per = [];
-  for (const [sym, x] of all) per.push([sym, simulate(sym, x.data, x.recs, thr, x.zoneCache)]);
-  const allTrades = per.flatMap(([, t]) => t);
-  summary.push({ thr, stats: stats(allTrades), per, trades: allTrades });
-}
-
-const main = summary.find((s) => s.thr === baseThr) ?? summary[0];
-console.log(`\nРезультаты при пороге ${main.thr} (комиссия ${cfg.risk.feePct}% учтена):\n${HEAD}`);
-for (const [sym, t] of main.per) console.log(row(sym.replace(/USDT$/, ''), stats(t)));
-console.log(row('ИТОГО', main.stats));
-console.log(`В среднем ${perDay(main.stats.n)} сделки в день по всем монетам (${(main.stats.n / days / Math.max(1, main.per.length)).toFixed(2)} на монету).`);
+const summary = thresholds.map((thr) => ({ thr, stats: stats(runs.get(thr)), trades: runs.get(thr) }));
+const main = summary.find((s) => s.thr === mainThr);
+say(`\nРезультаты при пороге ${main.thr} (комиссия ${cfg.risk.feePct}% учтена):\n${HEAD}`);
+for (const [sym, t] of perSym) say(row(sym.replace(/USDT$/, ''), stats(t)));
+say(row('ИТОГО', main.stats));
+say(`В среднем ${perDay(main.stats.n)} сделки в день по всем монетам (${(main.stats.n / days / Math.max(1, perSym.length)).toFixed(2)} на монету).`);
+const group = (key) => { const g = {}; for (const t of main.trades) (g[t[key]] ??= []).push(t); return g; };
 const byWhy = {};
 for (const t of main.trades) byWhy[t.why] = (byWhy[t.why] ?? 0) + 1;
-console.log(`\nЧем закончились сделки: ${Object.entries(byWhy).map(([k, v]) => `${WHY_RU[k] ?? k} ${v}`).join(', ') || '—'}`);
-const byRegime = {};
-for (const t of main.trades) (byRegime[t.regime] ??= []).push(t);
-console.log('По режимам рынка:');
-for (const [k, t] of Object.entries(byRegime)) console.log(`  ${row(REG_RU[k] ?? k, stats(t))}`);
-const byVia = {};
-for (const t of main.trades) (byVia[t.via] ??= []).push(t);
-console.log('По способу входа:');
-for (const [k, t] of Object.entries(byVia)) console.log(`  ${row(k, stats(t))}`);
+say(`\nЧем закончились сделки: ${Object.entries(byWhy).map(([k, v]) => `${WHY_RU[k] ?? k} ${v}`).join(', ') || '—'}`);
+const byRegime = group('regime');
+say('По режимам рынка:');
+for (const [k, t] of Object.entries(byRegime)) say(`  ${row(REG_RU[k] ?? k, stats(t))}`);
+const byVia = group('via');
+say('По способу входа:');
+for (const [k, t] of Object.entries(byVia)) say(`  ${row(k, stats(t))}`);
+
+// счёт целиком: те же сделки, но с риском в % баланса и правилами защиты капитала — как у автоторговли
+const startEq = cfg.risk.deposit > 0 ? cfg.risk.deposit : 10000;
+const account = { protect: simulateAccount(main.trades, cfg.trade, { start: startEq }), plain: simulateAccount(main.trades, cfg.trade, { start: startEq, protect: false }) };
+say(`\nСчёт целиком (риск ${cfg.trade.riskPct}% на сделку, плечо до ×${cfg.trade.leverage}, до ${cfg.trade.maxPositions} позиций):`);
+say(`  с правилами защиты:  ${accountText(account.protect)}`);
+say(`  без правил защиты:   ${accountText(account.plain)}`);
 
 // сравнение способов входа на одних и тех же оценках: ретест (2.8), касание зоны (2.7), сразу по сигналу
+let cmp = null;
 if (compare) {
-  console.log(`\nСравнение способов входа (порог ${main.thr}):\n${'способ'.padEnd(12)}${HEAD.slice(12)}`);
-  const cmp = [];
-  for (const [m, name] of [['retest', 'ретест'], ['touch', 'касание 2.7'], ['signal', 'по сигналу']]) {
-    const tr = m === entryMode ? main.trades : [...all].flatMap(([sym, x]) => simulate(sym, x.data, x.recs, main.thr, x.zoneCache, m));
-    const st = stats(tr);
-    cmp.push({ m, st });
-    console.log(row(name, st));
-  }
+  say(`\nСравнение способов входа (порог ${main.thr}):\n${'способ'.padEnd(12)}${HEAD.slice(12)}`);
+  cmp = CMP.map(([m, name]) => ({ m, name, st: stats(cmpRuns.get(m)) }));
+  for (const x of cmp) say(row(x.name, x.st));
   const [rt, tc] = cmp;
   if (rt.st.n >= 10 && tc.st.n >= 10) {
     const better = rt.st.avgR > tc.st.avgR && (rt.st.pf ?? 0) >= (tc.st.pf ?? 0);
-    console.log(`\n${better ? 'Вход на ретесте лучше прежнего' : 'Вход на ретесте на этих данных не лучше прежнего'}: в среднем ${rt.st.avgR.toFixed(2)}R против ${tc.st.avgR.toFixed(2)}R на сделку, PF ${pf(rt.st.pf)} против ${pf(tc.st.pf)}, сделок ${rt.st.n} против ${tc.st.n}.`);
-  } else console.log('\nСделок мало для вывода — увеличьте период (--days 180) или добавьте монеты.');
+    say(`\n${better ? 'Вход на ретесте лучше прежнего' : 'Вход на ретесте на этих данных не лучше прежнего'}: в среднем ${rt.st.avgR.toFixed(2)}R против ${tc.st.avgR.toFixed(2)}R на сделку, PF ${pf(rt.st.pf)} против ${pf(tc.st.pf)}, сделок ${rt.st.n} против ${tc.st.n}.`);
+  } else say('\nСделок мало для вывода — увеличьте период (--days 180) или добавьте монеты.');
 }
 
+// половины периода: держится ли результат на новых данных
+const halfStats = (tr) => ({ first: stats(tr.filter((t) => !t.second)), second: stats(tr.filter((t) => t.second)) });
 if (grid) {
-  console.log(`\nПеребор порога:\n${'порог'.padEnd(12)}${HEAD.slice(12)}`);
-  for (const s of summary) console.log(row(String(s.thr), s.stats));
+  say(`\nПеребор порога:\n${'порог'.padEnd(12)}${HEAD.slice(12)}`);
+  for (const s of summary) say(row(String(s.thr), s.stats));
   const ok = summary.filter((s) => s.stats.n >= 10 && s.stats.pf != null && s.stats.pf >= 1.2);
   const best = [...(ok.length ? ok : summary)].sort((a, b) => b.stats.sumR - a.stats.sumR)[0];
-  console.log(`\nЛучший итог за весь период: порог ${best.thr} (сумма ${best.stats.sumR.toFixed(1)}R, PF ${pf(best.stats.pf)}, сделок ${best.stats.n}).`);
+  say(`\nЛучший итог за весь период: порог ${best.thr} (сумма ${best.stats.sumR.toFixed(1)}R, PF ${pf(best.stats.pf)}, сделок ${best.stats.n}).`);
 
   // проверка на новых данных: подбираем порог по первой половине периода, проверяем на второй
-  const split = (s) => {
-    const first = [], second = [];
-    for (const t of s.trades) {
-      const d = all.get(t.sym).data;
-      const mid = d.start + Math.floor((d.h1.length - d.start) / 2);
-      (t.entryIdx < mid ? first : second).push(t);
-    }
-    return { first: stats(first), second: stats(second) };
-  };
-  const halves = summary.map((s) => ({ thr: s.thr, ...split(s) }));
+  const halves = summary.map((s) => ({ thr: s.thr, ...halfStats(s.trades) }));
   const okIn = halves.filter((h) => h.first.n >= 5);
   const pick = [...(okIn.length ? okIn : halves)].sort((a, b) => b.first.sumR - a.first.sumR)[0];
-  console.log(`\nПроверка на новых данных (подбор на первой половине периода, проверка на второй):`);
-  console.log(`${'порог'.padEnd(12)}${'1-я половина'.padStart(22)}${'2-я половина'.padStart(24)}`);
-  for (const h of halves) console.log(`${String(h.thr).padEnd(12)}${`${h.first.n} сд. ${h.first.sumR.toFixed(1)}R PF ${pf(h.first.pf)}`.padStart(22)}${`${h.second.n} сд. ${h.second.sumR.toFixed(1)}R PF ${pf(h.second.pf)}`.padStart(24)}`);
+  say(`\nПроверка на новых данных (подбор на первой половине периода, проверка на второй):`);
+  say(`${'порог'.padEnd(12)}${'1-я половина'.padStart(22)}${'2-я половина'.padStart(24)}`);
+  for (const h of halves) say(`${String(h.thr).padEnd(12)}${`${h.first.n} сд. ${h.first.sumR.toFixed(1)}R PF ${pf(h.first.pf)}`.padStart(22)}${`${h.second.n} сд. ${h.second.sumR.toFixed(1)}R PF ${pf(h.second.pf)}`.padStart(24)}`);
   // честная проверка: прибыль на второй половине должна быть не случайной (PF ≥ 1.1 и хотя бы 5 сделок)
   const pf2 = pick.second.pf ?? 0, pf1 = pick.first.pf ?? 0;
   const holds = pick.second.n >= 5 && pick.second.sumR > 0 && pf2 >= 1.1;
   const weaker = holds && pf1 !== Infinity && pf2 < 1 + (pf1 - 1) * 0.5;
-  console.log(`\nПорог ${pick.thr}, выбранный по первой половине, на второй: ${pick.second.n} сделок, ${pick.second.sumR.toFixed(1)}R, PF ${pf(pick.second.pf)} — ${!holds ? 'на новых данных не подтвердился ✗ (возможно, подгонка под историю)' : weaker ? 'держится, но заметно слабее, чем на истории (часть результата — подгонка)' : 'результат держится ✓'}.`);
+  say(`\nПорог ${pick.thr}, выбранный по первой половине, на второй: ${pick.second.n} сделок, ${pick.second.sumR.toFixed(1)}R, PF ${pf(pick.second.pf)} — ${!holds ? 'на новых данных не подтвердился ✗ (возможно, подгонка под историю)' : weaker ? 'держится, но заметно слабее, чем на истории (часть результата — подгонка)' : 'результат держится ✓'}.`);
   // самый устойчивый порог: лучший худший PF из двух половин (по 10+ сделок в каждой)
   const minPf = (h) => Math.min(h.first.pf ?? 0, h.second.pf ?? 0);
   const both = halves.filter((h) => h.first.n >= 10 && h.second.n >= 10).sort((a, b) => minPf(b) - minPf(a));
   const stable = both[0];
-  if (stable) console.log(`Устойчивее всего (работает в обеих половинах, по 10+ сделок): порог ${stable.thr} — PF ${pf(stable.first.pf)} и ${pf(stable.second.pf)}.`);
+  if (stable) say(`Устойчивее всего (работает в обеих половинах, по 10+ сделок): порог ${stable.thr} — PF ${pf(stable.first.pf)} и ${pf(stable.second.pf)}.`);
   const def = cfg.signal.threshold;
-  if (stable && minPf(stable) >= 1.15) console.log(`Рекомендация: THRESHOLD=${stable.thr} в .env${stable.thr === def ? ' (это и есть значение по умолчанию)' : ''}.`);
-  else console.log(`Рекомендация: ни один порог не даёт устойчивого преимущества на этих данных — оставьте ${def} и проверьте на более длинном периоде (--days 365).`);
+  if (stable && minPf(stable) >= 1.15) say(`Рекомендация: THRESHOLD=${stable.thr} в .env${stable.thr === def ? ' (это и есть значение по умолчанию)' : ''}.`);
+  else say(`Рекомендация: ни один порог не даёт устойчивого преимущества на этих данных — оставьте ${def} и проверьте на более длинном периоде (--days 365).`);
 }
 
-const out = path.join(dir, 'data', `backtest-${new Date().toISOString().slice(0, 10)}.json`);
-fs.mkdirSync(path.dirname(out), { recursive: true });
-fs.writeFileSync(out, JSON.stringify({ days, step, thresholds: summary.map((s) => ({ thr: s.thr, ...s.stats })), trades: main.trades.map((t) => ({ ...t, entryTime: all.get(t.sym).data.h1[t.entryIdx]?.time, exitTime: all.get(t.sym).data.h1[t.exitIdx]?.time })) }, null, 1));
-console.log(`\nСделки сохранены в ${path.relative(dir, out)} · время ${Math.round((Date.now() - t0) / 1000)} с`);
+const slim = (t) => { const { safeIdx, second, ...x } = t; return { ...x, entryTime: t.t0, exitTime: t.t1 }; };
+fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
+if (!jsonOut) {
+  const out = path.join(dir, 'data', `backtest-${new Date().toISOString().slice(0, 10)}.json`);
+  fs.writeFileSync(out, JSON.stringify({ days, step, thresholds: summary.map((s) => ({ thr: s.thr, ...s.stats })), account, trades: main.trades.map(slim) }, null, 1));
+  say(`\nСделки сохранены в ${path.relative(dir, out)} · время ${Math.round((Date.now() - t0) / 1000)} с`);
+}
 if (main.trades.length) {
-  console.log('\nПоследние сделки:');
-  const tOf = (t) => all.get(t.sym).data.h1[t.entryIdx]?.time ?? 0;
-  for (const t of [...main.trades].sort((a, b) => tOf(a) - tOf(b)).slice(-8)) {
-    const d = all.get(t.sym).data.h1;
-    console.log(`  ${new Date(d[t.entryIdx].time).toISOString().slice(0, 13)} ${t.sym.replace(/USDT$/, '').padEnd(6)} ${t.side === 'BUY' ? 'покупка' : 'продажа'} ${fmt(t.entry)} → ${fmt(t.exit)} (${WHY_RU[t.why] ?? t.why}, ${t.r >= 0 ? '+' : ''}${t.r.toFixed(2)}R, ${t.via})`);
+  say('\nПоследние сделки:');
+  for (const t of [...main.trades].sort((a, b) => a.t0 - b.t0).slice(-8)) {
+    say(`  ${new Date(t.t0).toISOString().slice(0, 13)} ${t.sym.replace(/USDT$/, '').padEnd(6)} ${t.side === 'BUY' ? 'покупка' : 'продажа'} ${fmt(t.entry)} → ${fmt(t.exit)} (${WHY_RU[t.why] ?? t.why}, ${t.r >= 0 ? '+' : ''}${t.r.toFixed(2)}R, ${t.via})`);
   }
+}
+
+// итог одним файлом — для самопроверки программы (lib/selftest.js) и панели
+if (jsonOut) {
+  const J = (st) => ({ ...st, pf: st.pf === Infinity ? 999 : st.pf });
+  const mapStats = (g) => Object.fromEntries(Object.entries(g).map(([k, t]) => [k, J(stats(t))]));
+  const result = {
+    at: Date.now(), days, step, fast, symbols: done, stocks: done.filter(isStockSym).length, threshold: main.thr, entry: entryMode, feePct: cfg.risk.feePct,
+    stats: J(main.stats), perDay: main.stats.n / days, halves: (({ first, second }) => ({ first: J(first), second: J(second) }))(halfStats(main.trades)),
+    byVia: mapStats(byVia), byRegime: mapStats(byRegime), bySymbol: Object.fromEntries(perSym.map(([sym, t]) => [sym, J(stats(t))])),
+    compare: cmp ? Object.fromEntries(cmp.map((x) => [x.m, J(x.st)])) : null,
+    account, risk: { riskPct: cfg.trade.riskPct, leverage: cfg.trade.leverage, maxPositions: cfg.trade.maxPositions },
+    seconds: Math.round((Date.now() - t0) / 1000),
+  };
+  const file = path.isAbsolute(jsonOut) ? jsonOut : path.join(dir, jsonOut);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(result));
+  fs.renameSync(`${file}.tmp`, file);
+  say(`Итог записан в ${path.relative(dir, file)}`);
 }

@@ -11,6 +11,7 @@
 //   node index.js --trade-status      — открытые сделки программы на Bybit и итоги
 //   node index.js --close-all         — закрыть все сделки программы на Bybit
 //   node index.js --pause-trading     — приостановить новые сделки (--resume-trading — снять паузу)
+//   node index.js --selftest          — самопроверка сейчас: бэктест на свежей истории и вывод
 //   node index.js --why               — почему нет сделок: разбор по шагам и последние решения программы
 //   флаги: --top N --threshold X --poll S --verbose --no-news --no-whales --no-server
 import fs from 'node:fs';
@@ -46,6 +47,7 @@ const { Notifier } = await import('./lib/notifier.js');
 const { analyze } = await import('./lib/analyzer.js');
 const { selectUniverse } = await import('./lib/universe.js');
 const { startServer } = await import('./lib/server.js');
+const { SelfTest } = await import('./lib/selftest.js');
 const { MacroCalendar } = await import('./lib/calendar.js');
 const { Trader, MODE_RU } = await import('./lib/trader.js');
 const { writeJsonAtomic, readJson } = await import('./lib/storage.js');
@@ -66,7 +68,7 @@ const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args.spl
 const bool = (n) => { const i = args.indexOf(`--${n}`); if (i < 0) return false; args.splice(i, 1); return true; };
 const once = bool('once'), verbose = bool('verbose'), testNotify = bool('test-notify'), digestNow = bool('digest-now'), showStats = bool('stats');
 const tradeCheck = bool('trade-check'), tradeStatus = bool('trade-status'), closeAll = bool('close-all');
-const pauseTrading = bool('pause-trading'), resumeTrading = bool('resume-trading'), showWhy = bool('why');
+const pauseTrading = bool('pause-trading'), resumeTrading = bool('resume-trading'), showWhy = bool('why'), selfTestNow = bool('selftest');
 if (bool('no-news')) cfg.news.enabled = false;
 if (bool('no-whales')) cfg.whales.enabled = false;
 if (bool('no-server') || once) cfg.server.port = 0;
@@ -106,10 +108,29 @@ const flow = new TradeFlow(cfg, { onWhale: (ev, d) => { onWhale(ev, d).catch((e)
 const streamsOn = cfg.whales.enabled && !once && BinanceStream.supported();
 const spotStream = new BinanceStream({ name: 'спот', base: cfg.streams.spotWs, fallback: cfg.streams.spotFallback, onMessage: (d) => { if (d.e === 'aggTrade') flow.handleTrade('spot', d); } });
 const trader = new Trader(cfg, { file: file(cfg.files.trades), onEvent: (ev) => onTradeEvent(ev) });
+const selfTest = new SelfTest(cfg, { dir, guard: () => cfg.selftest.enabled && cfg.selftest.guard && trader.enabled });
 const futStream = new BinanceStream({
   name: 'фьючерсы', base: cfg.streams.futuresWs,
   onMessage: (d) => { if (d.e === 'aggTrade') flow.handleTrade('futures', d); else if (d.e === 'forceOrder') liq.handle(d); },
 });
+
+// что проверять: то, чем программа торгует, — монеты и (при TRADE_STOCKS=1) акции
+const savedSymbols = (f, key) => { try { return JSON.parse(fs.readFileSync(file(f), 'utf8'))[key].map((c) => c.symbol); } catch { return []; } };
+function selfTestSymbols(list = []) {
+  const live = list.filter((c) => c.kind !== 'stock' || cfg.trade.stocks).map((c) => c.symbol);
+  if (live.length) return live;
+  // список ещё не загружен (команда --selftest) — сохранённый топ монет и, если сделки по акциям включены, акций
+  return manual ?? [...savedSymbols(cfg.universe.cacheFile, 'coins'), ...(cfg.trade.stocks ? savedSymbols(cfg.stocks.cacheFile, 'stocks') : [])];
+}
+
+// самопроверка по команде: бэктест на свежей истории прямо сейчас (ход виден на экране)
+if (selfTestNow) {
+  console.log(`🧪 Самопроверка: бэктест за ${cfg.selftest.days} дн. на свежей истории биржи…\n`);
+  const res = await selfTest.run({ quiet: false, symbols: selfTestSymbols() });
+  if (!res) { console.error(`\n⛔ Самопроверка не удалась: ${selfTest.lastError}`); process.exit(1); }
+  console.log(`\n🧪 Итог самопроверки:\n  ${selfTest.lines().join('\n  ')}`);
+  process.exit(0);
+}
 
 if (showStats) {
   const s = journal.stats(30);
@@ -566,6 +587,15 @@ async function handleResult(r, { zone = false } = {}) {
   }
 
   if (strong) {
+    // разворот: подтверждён сигнал против открытой сделки — закрываем её сразу, не дожидаясь стопа
+    // (сделка в новую сторону — отдельно, на ретесте уровня; при входе из зоны разворот делает сам trader.onSignal)
+    if (!zone && cfg.trade.exitOnReversal) {
+      const shut = await trader.exitOnSignal(sym, r.action);
+      if (shut) {
+        console.log(`🔄 Bybit: ${coinOf(sym)} — ${shut.side === 'Buy' ? 'лонг' : 'шорт'} закрыт по развороту: подтверждён сигнал ${ACT_RU[r.action]} (оценка ${sgn(r.score)})`);
+        note(sym, 'reversal', `подтверждён сигнал ${ACT_RU[r.action]} (оценка ${sgn(r.score)}) против открытой сделки — ${shut.side === 'Buy' ? 'лонг' : 'шорт'} закрыт, не дожидаясь стопа${shut.pnl != null ? `: ${fmtMoney(shut.pnl, { sign: true })}` : ''}`, { dir: r.action, key: 'reversal', merge: false });
+      }
+    }
     const z0 = zone ? state.zones[sym] : null;
     // письмо по этой зоне уже ушло, а сделка не открылась по причине, которая могла пройти сама, — пробуем ещё раз
     if (z0?.notifiedAt) { await retryZoneTrade(r, z0); return; }
@@ -963,6 +993,7 @@ async function sendDigest() {
     liqMarket: streamsOn ? liq.marketSummary(1440) : null, whalesDay: streamsOn ? whalesDay : null, newsTop, health: health().text,
     events: calendar.upcoming(Date.now(), 7 * 24),
     trading: trader.enabled || trader.openTrades().length ? trader.status() : null,
+    selftest: selfTest.status(),
   });
   logAlert(m.subject);
   await notifier.broadcast(m);
@@ -1020,6 +1051,7 @@ const app = {
     news: [...results.values()].flatMap((r) => r.news?.top ?? []).filter((n, i, a) => a.findIndex((x) => x.title === n.title) === i).sort((a, b) => b.time - a.time).slice(0, 12),
     whales4h: streamsOn ? Object.fromEntries(coins.map((c) => [c.symbol, flow.summary(c.symbol, 240)?.whales]).filter(([, w]) => w)) : {},
     trading: trader.enabled || trader.openTrades().length ? trader.status() : null,
+    selftest: selfTest.status(),
     zones: zonesNow(),
     emailEvents: cfg.notify.events.map((x) => EMAIL_EVENT_NAMES[x] ?? x),
     why: diagnose({ trading: tradingInfo(), list: decisions.list, zones: zonesNow(), confirmPolls: cfg.signal.confirmPolls, stocks: stocksStatus() }),
@@ -1034,6 +1066,32 @@ const app = {
     },
   }),
 };
+
+// ── самопроверка на истории ────────────────────────────────────────────────
+// вывод прошлой проверки → множитель риска сделок; письмо — когда вывод стал плохим или перестал им быть
+function applySelfTest({ notify = false } = {}) {
+  const v = cfg.selftest.enabled ? selfTest.verdict() : null; // SELF_TEST=0 — старый итог на риск не влияет
+  const bad = v?.level === 'bad';
+  trader.extraRisk = bad && cfg.selftest.guard ? { mult: v.mult, note: `риск ×${v.mult}: самопроверка на истории в минусе` } : null;
+  if (!notify || !v) return;
+  const prev = state.selfTestLevel ?? null;
+  state.selfTestLevel = v.level;
+  saveState();
+  const lines = selfTest.lines();
+  if (bad && prev !== 'bad') {
+    critical('⚠️ Crypto Watcher: самопроверка — на истории стратегия в минусе', `${lines.join('\n')}\n\n${trader.extraRisk && trader.enabled ? `Риск останется уменьшенным до следующей проверки (через ${cfg.selftest.everyDays} дн.): если она покажет, что стратегия не в минусе, он вернётся к обычному. ` : ''}Что можно сделать: поднять порог сигнала (node backtest.js --grid подскажет значение), уменьшить TRADE_RISK_PCT или приостановить сделки: node index.js --pause-trading. В истории нет стакана, деривативов и новостей, поэтому это оценка, а не приговор.`);
+  } else if (!bad && prev === 'bad') {
+    critical(`${v.level === 'good' ? '✅' : 'ℹ️'} Crypto Watcher: самопроверка — вывод «в минусе» снят`, `${lines.join('\n')}${cfg.selftest.guard ? '\n\nРиск сделок возвращён к обычному.' : ''}`);
+  }
+}
+
+async function runSelfTest() {
+  console.log(`🧪 Самопроверка: бэктест за ${cfg.selftest.days} дн. на свежей истории — отдельным процессом, работе не мешает`);
+  const res = await selfTest.run({ symbols: selfTestSymbols(coins) });
+  if (!res) { console.error(`🧪 Самопроверка не удалась: ${selfTest.lastError} — повторю через ${selfTest.retryHours()} ч`); return; }
+  applySelfTest({ notify: true });
+  for (const l of selfTest.lines()) console.log(`🧪 ${l}`);
+}
 
 let restrictedAlerted = false;
 const errorAlerted = new Set();
@@ -1097,6 +1155,7 @@ async function shutdown() {
   if (!running) return;
   running = false;
   console.log('\nОстанавливаюсь…');
+  selfTest.stop(); // самопроверка, если идёт, начнётся заново после запуска
   spotStream.stop(); futStream.stop(); flow.stop();
   // операция с биржей (вход, перенос стопа) не должна оборваться на середине
   await Promise.race([trader.queue, sleep(15e3)]);
@@ -1110,6 +1169,7 @@ process.on('SIGTERM', shutdown);
 process.on('unhandledRejection', (e) => console.error('Необработанная ошибка:', e));
 process.on('uncaughtException', (e) => {
   console.error('Критическая ошибка — сохраняю состояние и перезапускаюсь:', e);
+  try { selfTest.stop({ forgive: false }); } catch { /* ignore */ }
   saveAll();
   process.exit(1);
 });
@@ -1153,6 +1213,14 @@ if (tradingOn) {
 }
 await refreshUniverse(true);
 if (!once) {
+  applySelfTest(); // итог прошлой самопроверки: если стратегия на истории в минусе — риск сделок вдвое меньше
+  if (cfg.selftest.enabled && selfTest.verdict()) console.log(`🧪 Самопроверка на истории (${fmtDate(selfTest.result.at)}): ${selfTest.lines().at(-1).replace(/^Вывод: /, '')}`);
+  setInterval(() => {
+    if (!running) return;
+    // итог мог обновиться командой --selftest; устаревший итог перестаёт влиять на риск
+    if (selfTest.reload()) { applySelfTest({ notify: true }); for (const l of selfTest.lines()) console.log(`🧪 ${l}`); } else applySelfTest();
+    if (selfTest.due()) runSelfTest().catch((e) => console.error('🧪 Самопроверка:', e.message));
+  }, 60e3).unref();
   startServer(cfg, app);
   setInterval(liveTick, 5000).unref();
   if (tradingOn) setInterval(() => { trader.tick().catch((e) => console.error('Bybit:', e.message)); }, cfg.trade.tickSeconds * 1000).unref();
