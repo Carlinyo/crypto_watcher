@@ -13,6 +13,7 @@
 //   node index.js --pause-trading     — приостановить новые сделки (--resume-trading — снять паузу)
 //   node index.js --selftest          — самопроверка сейчас: бэктест на свежей истории и вывод
 //   node index.js --why               — почему нет сделок: разбор по шагам и последние решения программы
+//   node index.js --telegram-test     — проверить бота и каналы Telegram и отправить в них тестовый пост
 //   флаги: --top N --threshold X --poll S --verbose --no-news --no-whales --no-server
 import fs from 'node:fs';
 import path from 'node:path';
@@ -59,8 +60,10 @@ const { loadStocks, stocksEnabled, stockSessionOpen, nextSessionOpen, sessionRea
 const { chartPng, chartSvg } = await import('./lib/chart.js');
 const { atr, lastValid } = await import('./lib/indicators.js');
 const { sleep } = await import('./lib/http.js');
-const { coinOf, fmt, fmtUsd, fmtMoney, fmtDate, fmtDuration, sgn, trades: nTrades, escapeHtml } = await import('./lib/format.js');
+const { coinOf, fmt, fmtUsd, fmtUsdRound, fmtMoney, fmtDate, fmtDuration, sgn, trades: nTrades, escapeHtml } = await import('./lib/format.js');
 const R = await import('./lib/report.js');
+const { Telegram } = await import('./lib/telegram.js');
+const TG = await import('./lib/channel.js');
 
 // ── аргументы ──────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -69,6 +72,7 @@ const bool = (n) => { const i = args.indexOf(`--${n}`); if (i < 0) return false;
 const once = bool('once'), verbose = bool('verbose'), testNotify = bool('test-notify'), digestNow = bool('digest-now'), showStats = bool('stats');
 const tradeCheck = bool('trade-check'), tradeStatus = bool('trade-status'), closeAll = bool('close-all');
 const pauseTrading = bool('pause-trading'), resumeTrading = bool('resume-trading'), showWhy = bool('why'), selfTestNow = bool('selftest');
+const tgTest = bool('telegram-test');
 if (bool('no-news')) cfg.news.enabled = false;
 if (bool('no-whales')) cfg.whales.enabled = false;
 if (bool('no-server') || once) cfg.server.port = 0;
@@ -95,6 +99,19 @@ if (check.tradeErrors.length) {
 const file = (f) => path.resolve(dir, f);
 const binance = new Binance(cfg);
 const notifier = new Notifier(cfg);
+// 📣 Telegram-каналы: платный и бесплатный
+const tg = new Telegram({ token: cfg.telegram.token });
+const tgChan = { paid: cfg.telegram.paid, free: cfg.telegram.free };
+const tgOn = tg.ready() && !!(tgChan.paid || tgChan.free);
+/** Пост в канал, если этот вид постов для него включён (TG_PAID_EVENTS / TG_FREE_EVENTS) */
+function tgPost(tier, kind, text, { photo = null, silent = false } = {}) {
+  const chat = tgChan[tier];
+  if (!tgOn || !chat || !text) return false;
+  if (!(tier === 'paid' ? cfg.telegram.paidEvents : cfg.telegram.freeEvents).includes(kind)) return false;
+  tg.post(chat, { text, photo, silent });
+  return true;
+}
+const pngOf = (r) => (cfg.telegram.charts ? chartFor(r).attachments[0]?.content ?? null : null);
 const news = new NewsService(cfg);
 const market = new MarketContext(cfg, file(cfg.files.market));
 const coinbase = new CoinbaseFeed(cfg);
@@ -488,7 +505,47 @@ function chartFor(r) {
 }
 
 // ── сигналы ────────────────────────────────────────────────────────────────
+/**
+ * Сигнал на вход — в каналы: в платный всегда, в бесплатный — каждый N-й (TG_FREE_EVERY). Какой сигнал попадёт в
+ * бесплатный, решается по счётчику в момент сигнала, до результата: подписчики видят обычные сигналы, а не отобранные удачные.
+ */
+function publishSignal(r, entry, { zone = false } = {}) {
+  const stats = journal.stats(30);
+  tgPost('paid', 'signal', TG.signalPost(r, 'paid', { zone, stats }), { photo: pngOf(r) });
+  const every = cfg.telegram.freeEvery;
+  if (!tgChan.free || !(every > 0)) return;
+  state.tg ??= { n: 0 };
+  const pick = state.tg.n % every === 0;
+  state.tg.n++;
+  if (pick && tgPost('free', 'signal', TG.signalPost(r, 'free', { zone, stats, paidLink: cfg.telegram.paidLink }))) {
+    entry.free = true; // итоги этого сигнала тоже пойдут в бесплатный канал
+    journal.save();
+  }
+  saveState();
+}
+
+// обзор рынка (каждый день) и итоги недели (по понедельникам) — в каналы
+function channelDaily() {
+  if (!tgOn) return;
+  const d = new Date(), today = d.toLocaleDateString('sv-SE');
+  if (d.getHours() < cfg.digest.hour || state.tgDaily === today) return;
+  const list = [...results.entries()].filter(([k]) => !k.includes('@')).map(([, v]) => v);
+  if (!list.length) return;
+  state.tgDaily = today;
+  saveState();
+  tgPost('paid', 'daily', TG.dailyPost({ results: list, market: market.snapshot(), stats: journal.stats(30), openSignals: journal.entries.filter((x) => x.status === 'open') }), { silent: true });
+  if (d.getDay() === 1) {
+    const week = journal.entries.filter((x) => x.status === 'closed' && x.closed >= Date.now() - 7 * 86400e3);
+    for (const tier of ['paid', 'free']) tgPost(tier, 'weekly', TG.weeklyPost(week, { stats30: journal.stats(30), tier, paidLink: cfg.telegram.paidLink }));
+  }
+}
+
 function notifyJournal(ev) {
+  if (tgOn) {
+    const post = TG.resultPost(ev, { stats: journal.stats(30) });
+    tgPost('paid', 'result', post);
+    if (ev.entry.free) tgPost('free', 'result', post);
+  }
   const m = R.journalMessage(ev, journal.stats(30));
   logAlert(m.subject, wants('journal'));
   if (wants('journal')) notifier.enqueue({ ...m, tag: m.subject.split(' ')[0] });
@@ -503,6 +560,7 @@ function checkReversal(r) {
   if (!against || r.action === (en.side === 'BUY' ? 'SELL' : 'BUY')) return; // сильный обратный сигнал закроет сделку сам
   en.reversalWarned = Date.now();
   journal.save();
+  tgPost('paid', 'warn', TG.reversalPost(en, r));
   const m = R.reversalMessage(en, r, {});
   logAlert(m.subject, wants('reversal'));
   if (!wants('reversal')) { console.log(m.subject); return; }
@@ -624,11 +682,13 @@ async function handleResult(r, { zone = false } = {}) {
       // письмо, SMS и сделка — в этот момент, если свежий анализ подтвердит вход
       armZone(r, { setup: true, touched: retestOn(r.plan) && atLevel });
       note(sym, 'wait', waitText(r, atLevel), { dir: r.action, key: 'wait' });
+      tgPost('paid', 'setup', TG.setupPost(r), { silent: true });
     } else if (trader.enabled && RETRY_CODES.has(r.exec?.code)) keepForRetry(r, now);
     else delete state.zones[sym];
     if (inZone && !r.exec) note(sym, 'signal', `${r.retest ? `ретест уровня ${levelTxt(r.retest.level)} удержался, цена ${fmt(r.price)}` : `цена ${fmt(r.price)} в зоне ${zoneTxt(r.plan)}`}${send ? ' — письмо отправлено' : ''}`, { dir: r.action, key: 'signal' });
 
-    if (!send && !opened) {
+    const forChannels = tgOn && inZone; // сигнал на вход уходит в каналы и без письма
+    if (!send && !opened && !forChannels) {
       saveState();
       if (inZone) logAlert(R.signalSubject(r, { zone }), false);
       else if (retestOn(r.plan)) {
@@ -642,8 +702,10 @@ async function handleResult(r, { zone = false } = {}) {
     }
     // открытые сигналы в ту же сторону — того же вида (монеты движутся вместе с биткоином, акции — с рынком)
     r.exposure = journal.entries.filter((x) => x.status === 'open' && x.symbol !== sym && x.side === r.action && isStock(x.symbol) === (r.kind === 'stock')).map((x) => ({ symbol: x.symbol, opened: x.opened }));
-    const { events } = journal.open(r);
+    const t0 = Date.now();
+    const { entry: jEntry, events } = journal.open(r);
     for (const ev of events) notifyJournal(ev);
+    if (tgOn && jEntry.opened >= t0) publishSignal(r, jEntry, { zone });
     notifier.drop(`watch:${sym}`); // «готовиться» по этой монете, ещё ждущее в очереди писем, устарело
     saveState();
     const subject = R.signalSubject(r, { zone });
@@ -813,6 +875,7 @@ async function onWhale(ev, decision) {
   whaleLog.length = Math.min(whaleLog.length, 300);
   if (!decision.alert) { if (verbose) console.log(`${line} — без письма: ${decision.reason}`); return; }
   console.log(line);
+  tgPost('paid', 'whales', TG.whalePost(ev), { silent: true });
   const ch = chartFor(results.get(ev.symbol));
   const trade = trader.openTrades().find((t) => t.symbol === ev.symbol) ?? null;
   const m = R.whaleMessage(ev, decision, { summary: flow.summary(ev.symbol, 60), result: results.get(ev.symbol), chartCid: ch.chartCid, trade, zone: state.zones[ev.symbol] ?? null, stock: isStock(ev.symbol) });
@@ -963,6 +1026,7 @@ function checkMove(c) {
     const m = R.moveMessage(mv, r, { liq: streamsOn ? liq.summary(sym, 15) : null, flow: streamsOn ? flow.summary(sym, 15) : null, chartCid: ch.chartCid });
     logAlert(m.subject, wants('moves'));
     if (wants('moves')) notifier.enqueue({ ...m, tag: '⚡', attachments: ch.attachments });
+    tgPost('paid', 'moves', TG.movePost(mv, r), { silent: true });
   })().finally(() => moving.delete(sym));
 }
 
@@ -1013,7 +1077,7 @@ function health() {
   const b = binance.status(), n = notifier.status();
   const tr = trader.enabled || trader.openTrades().length ? trader : null;
   const tradeText = tr ? `; Bybit (${MODE_RU[tr.mode]}): ${tr.ready ? `открыто ${tr.openTrades().length}, запросов ${tr.client.stats.requests}, ошибок ${tr.client.stats.errors}` : `не работает — ${tr.problem}`}` : '';
-  const text = `циклов ${cycles}, последний ${age == null ? '—' : `${Math.round(age)} с назад`}; Binance: вес ${b.weight.spot}/6000 (спот), ${b.weight.futures}/2400 (фьючерсы), запросов ${b.requests}, ошибок ${b.errors}; писем ${n.emails}, SMS ${n.sms}, ошибок отправки ${n.errors}${tradeText}`;
+  const text = `циклов ${cycles}, последний ${age == null ? '—' : `${Math.round(age)} с назад`}; Binance: вес ${b.weight.spot}/6000 (спот), ${b.weight.futures}/2400 (фьючерсы), запросов ${b.requests}, ошибок ${b.errors}; писем ${n.emails}, SMS ${n.sms}, ошибок отправки ${n.errors}${tgOn ? `; Telegram: постов ${tg.stats.sent}, ошибок ${tg.stats.errors}${tg.stats.lost ? `, не отправлено ${tg.stats.lost} (${tg.stats.lastError})` : ''}` : ''}${tradeText}`;
   return { ok, lastCycleSec: age == null ? null : Math.round(age), cycles, text, binance: b, notifier: n, trading: tr ? { ready: tr.ready, open: tr.openTrades().length, problem: tr.problem } : null, uptimeMin: Math.round((Date.now() - startedAt) / 60e3) };
 }
 
@@ -1042,6 +1106,7 @@ const app = {
     journal: journal.recent(100),
     alerts: alertLog,
     whales: whaleLog.slice(0, 50),
+    whaleRule: { emailMinUsd: cfg.whales.emailMinUsd, minutes: cfg.whales.series.minutes, sells: cfg.whales.includeSells },
     health: health(),
     streams: streamsOn ? [spotStream.status(), futStream.status()] : [],
     feeds: feedsSummary(),
@@ -1143,6 +1208,24 @@ if (testNotify) {
   process.exit(0);
 }
 
+// ── проверка Telegram ──────────────────────────────────────────────────────
+if (tgTest) {
+  if (!tg.ready()) { console.log('⚠️ Не задан TELEGRAM_BOT_TOKEN (токен от @BotFather) — см. раздел «📣 Telegram-каналы» в README'); process.exit(1); }
+  if (!tgChan.paid && !tgChan.free) { console.log('⚠️ Не заданы каналы: TG_PAID_CHANNEL и/или TG_FREE_CHANNEL'); process.exit(1); }
+  let ok = true;
+  for (const [tier, chat] of Object.entries(tgChan)) {
+    if (!chat) continue;
+    const c = await tg.check(chat);
+    ok &&= c.ok;
+    console.log(`${c.ok ? '✅' : '❌'} ${tier === 'paid' ? 'Платный' : 'Бесплатный'} канал — ${c.text}`);
+    if (c.ok) tg.post(chat, { text: `✅ Crypto Watcher подключён к ${tier === 'paid' ? 'платному' : 'бесплатному'} каналу. Тестовое сообщение — его можно удалить.`, silent: true });
+  }
+  await tg.drain(30e3);
+  const st = tg.status();
+  console.log(st.lost ? `❌ Не отправлено: ${st.lastError}` : ok ? 'Готово: проверьте каналы — там должно быть тестовое сообщение.' : 'Исправьте ошибки выше и запустите проверку снова.');
+  process.exit(ok && !st.lost ? 0 : 1);
+}
+
 // ── запуск ─────────────────────────────────────────────────────────────────
 let running = true;
 const lock = new InstanceLock(file('data/instance.lock'));
@@ -1161,6 +1244,7 @@ async function shutdown() {
   await Promise.race([trader.queue, sleep(15e3)]);
   saveAll();
   await Promise.race([notifier.flush(), sleep(10e3)]);
+  if (tgOn) await tg.drain(10e3);
   lock.release();
   process.exit(0);
 }
@@ -1231,7 +1315,9 @@ if (!once) {
     if (since > limit) { console.error(`Сторож: анализ не завершался ${Math.round(since / 60e3)} мин — перезапуск`); try { journal.save(); } catch { /* ignore */ } process.exit(1); }
   }, 60e3).unref();
   console.log(`Уведомления: ${notifier.channels({ masked: true }).join(', ')}`);
-  if (streamsOn) console.log(`Киты: ${cfg.whales.markets.join(' + ')}, порог от ${fmtUsd(cfg.whales.minUsd)}; письмо — от ${cfg.whales.alertX}× порога и в числе ${cfg.whales.targetPerDay} крупнейших покупок за сутки`);
+  if (tgOn) console.log(`📣 Telegram: ${[tgChan.paid && `платный ${tgChan.paid} (все сигналы и разбор)`, tgChan.free && `бесплатный ${tgChan.free} (${cfg.telegram.freeEvery > 0 ? cfg.telegram.freeEvery === 1 ? 'все сигналы кратко' : `каждый ${cfg.telegram.freeEvery}-й сигнал кратко` : 'только итоги недели'})`].filter(Boolean).join(', ')}`);
+  else if (cfg.telegram.paid || cfg.telegram.free) console.log('📣 Telegram: каналы заданы, но нет TELEGRAM_BOT_TOKEN — в каналы ничего не уходит');
+  if (streamsOn) console.log(`Киты: ${cfg.whales.markets.join(' + ')}, порог от ${fmtUsd(cfg.whales.minUsd)}; письмо — ${cfg.whales.emailMinUsd > 0 ? `только когда кит ${cfg.whales.includeSells ? 'купил или продал' : 'купил'} на ${fmtUsdRound(cfg.whales.emailMinUsd)} и больше (одной сделкой или набором за ${cfg.whales.series.minutes} мин)` : `от ${cfg.whales.alertX}× порога и в числе ${cfg.whales.targetPerDay} крупнейших покупок за сутки`}`);
   console.log(`Порог сигнала ±${cfg.signal.threshold}, подтверждение ${cfg.signal.confirmPolls} проверки, опрос каждые ${cfg.pollSeconds} с. Ctrl+C — выход.\n`);
 }
 
@@ -1287,6 +1373,7 @@ do {
     saveState();
     await sendDigest().catch((e) => console.error('Обзор:', e.message));
   }
+  if (!once) { try { channelDaily(); } catch (e) { console.error('📣 Обзор для канала:', e.message); } }
   firstCycle = false;
   if (!once && running) await sleep(Math.max(5000, cfg.pollSeconds * 1000 - (Date.now() - started)));
 } while (!once && running);

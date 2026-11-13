@@ -120,6 +120,8 @@ export default {
     clusterMs: 100,
     includeSells: bool(env.WHALE_SELLS, false),
     sms: bool(env.WHALE_SMS, false),
+    // письмо о ките — только когда его сделки дошли до этой суммы: одной сделкой или набором за 10 минут (0 — без этой границы)
+    emailMinUsd: num(env.WHALE_EMAIL_MIN_USD, 30000000),
     alertX: num(env.WHALE_ALERT_X, 2),          // письмо — от 2× порога кита…
     targetPerDay: num(env.WHALE_PER_DAY, 3),     // …и только если покупка входит в N крупнейших за сутки
     maxPerDay: num(env.WHALE_MAX_PER_DAY, 30),   // общий лимит писем о китах в сутки
@@ -205,6 +207,19 @@ export default {
   },
 
   digest: { enabled: bool(env.DIGEST, true), hour: num(env.DIGEST_HOUR, 9) },
+
+  // 📣 Telegram-каналы: платный — все сигналы с разбором, сопровождение, киты, резкие движения, обзор рынка;
+  // бесплатный — каждый N-й сигнал кратко, его итоги и итоги недели. Бот должен быть администратором обоих каналов.
+  telegram: {
+    token: clean(env.TELEGRAM_BOT_TOKEN) || '',
+    paid: clean(env.TG_PAID_CHANNEL) || '',
+    free: clean(env.TG_FREE_CHANNEL) || '',
+    freeEvery: num(env.TG_FREE_EVERY, 3),          // в бесплатный — каждый 3-й сигнал (1 — все, 0 — ни одного, только итоги недели)
+    paidLink: clean(env.TG_PAID_LINK) || '',       // ссылка, по которой подписчики бесплатного канала попадут в платный
+    paidEvents: list(env.TG_PAID_EVENTS, ['signal', 'setup', 'result', 'warn', 'whales', 'moves', 'daily', 'weekly']),
+    freeEvents: list(env.TG_FREE_EVENTS, ['signal', 'result', 'weekly']),
+    charts: bool(env.TG_CHARTS, true),             // график к сигналу (в платном канале)
+  },
 
   // самопроверка: раз в неделю программа сама прогоняет бэктест на свежей истории (отдельным процессом) и показывает итог
   // в панели; если стратегия на истории в минусе — предупреждает и (SELF_TEST_GUARD) вдвое уменьшает риск сделок
