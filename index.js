@@ -1347,6 +1347,19 @@ if (tradingOn) {
   }
   if (!trader.ready) critical('⚠️ Crypto Watcher: автоторговля на Bybit не запустилась', `${trader.describe()}\n\nПроверьте ключ командой node index.js --trade-check. Сигналы и киты работают как обычно; программа будет пробовать подключиться снова каждые 10 минут.`);
 }
+if (!once) {
+  const range = cfg.trade.range ? 'включена (TRADE_RANGE=1)' : 'выключена (TRADE_RANGE=0)';
+  const connection = tradingOn ? (trader.ready ? 'подключён' : 'ошибка подключения') : 'проверка не запускалась';
+  const pause = trader.userPause();
+  const dailyPause = trader.state.paused && trader.state.day === new Date().toLocaleDateString('sv-SE');
+  let entries = 'разрешены, жду сигнал';
+  if (!trader.enabled) entries = 'автоторговля выключена';
+  else if (!trader.ready) entries = 'жду подключения к Bybit';
+  else if (pause) entries = 'ручная пауза';
+  else if (dailyPause) entries = 'достигнут дневной лимит убытка';
+  else entries = trader.entryBlock() ?? entries;
+  console.log(`🤖 Старт торговли | Боковик: ${range} | Режим: ${trader.mode} | Bybit: ${connection} | Новые входы: ${entries}`);
+}
 await refreshUniverse(true);
 if (!once) {
   applySelfTest(); // итог прошлой самопроверки: если стратегия на истории в минусе — риск сделок вдвое меньше
