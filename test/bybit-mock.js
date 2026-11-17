@@ -160,6 +160,7 @@ export class MockBybit {
         o.orderStatus = 'Cancelled';
         return ok({ orderId: o.orderId, orderLinkId: o.orderLinkId });
       }
+      case '/v5/order/history':
       case '/v5/order/realtime': {
         if (q.orderLinkId) { const o = this.orders.get(q.orderLinkId); return ok({ category: 'linear', nextPageCursor: '', list: o ? [this.orderView(o)] : [] }); }
         if (!q.symbol && !q.settleCoin) fail(10001, 'symbol, baseCoin or settleCoin is required');

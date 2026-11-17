@@ -12,7 +12,7 @@ RUN mkdir -p /app/data && chown node:node /app/data
 VOLUME /app/data
 EXPOSE 8080
 # статус «healthy/unhealthy» в docker ps; при зависании программа сама завершается и Docker её перезапускает
-HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=5 CMD wget -qO- http://127.0.0.1:8080/health || exit 1
+HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=5 CMD wget -qO- "http://127.0.0.1:${PORT}/health" || exit 1
 # программа работает от пользователя node (см. docker-entrypoint.sh)
 ENTRYPOINT ["/bin/sh", "/app/docker-entrypoint.sh"]
 CMD ["node", "index.js"]
