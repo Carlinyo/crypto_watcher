@@ -160,3 +160,13 @@ test('Самопроверка: сделки от границ боковика 
   const d = decide({ score: 0.05, agreement: 0.3, completeness: 1, regime: { thresholdAdj: 0 }, htf: 0, btcScore: 0, isBtc: false, kind: 'crypto', plan: { ...rt.plan, entryType: 'none', rr: 0.5, rrNow: 0.3 }, range: rt }, c);
   assert.equal(d.isRange, false);
 });
+
+test('Консоль: боковик одной строкой', async () => {
+  const { rangeTag } = await import('../lib/report.js');
+  const g = { ok: true, low: 95.2, high: 104.8, regimeOk: true };
+  assert.equal(rangeTag({ range: { ok: false, why: 'диапазон широкий' } }), null);
+  assert.equal(rangeTag({ price: 96, action: 'BUY', isRange: true, range: { ...g, dir: 'BUY' } }), '↔️ боковик 95.2000–104.80: цена у нижней границы — сделка от границы: жду разворот 15-минутной свечи');
+  assert.equal(rangeTag({ price: 100, action: 'NEUTRAL', range: { ...g, dir: null } }), '↔️ боковик 95.2000–104.80: цена в середине (50%)');
+  assert.match(rangeTag({ price: 104, action: 'NEUTRAL', rangeVetoes: ['старший тренд против'], range: { ...g, dir: 'SELL' } }), /цена у верхней границы — от границы не вхожу: старший тренд против$/);
+  assert.match(rangeTag({ price: 104, action: 'NEUTRAL', range: { ...g, dir: 'SELL', regimeOk: false } }), /режим рынка не боковик/);
+});

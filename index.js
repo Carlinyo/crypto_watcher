@@ -202,6 +202,13 @@ if (showWhy) {
   const d = diagnose({ trading, list: saved.decisions ?? [], zones, now, confirmPolls: s?.confirmPolls ?? cfg.signal.confirmPolls, stocks: s?.stocks ?? null });
   const ICON = { bad: '⛔', warn: '⚠️', ok: '✅', info: 'ℹ️' };
   for (const l of d.lines) console.log(`${ICON[l.level]} ${l.text}`);
+  // ↔️ боковик по монетам
+  if (s?.ranges?.length) {
+    const found = s.ranges.filter((x) => x.tag), none = s.ranges.filter((x) => !x.tag);
+    console.log(`\n↔️ Торговля в боковике: ${s.rangeOn === false ? 'выключена (RANGE_TRADES=0 или самопроверка: на истории в минусе)' : 'включена'}. Боковик сейчас у ${found.length} из ${s.ranges.length}:`);
+    for (const x of found) console.log(`  ${coinOf(x.sym).padEnd(6)} ${x.tag}`);
+    if (none.length) console.log(`  Без боковика: ${none.map((x) => `${coinOf(x.sym)} (${(x.why ?? '').split(/ — |: | \(/)[0]})`).join(', ')}`);
+  }
   const recent = (saved.decisions ?? []).filter((x) => DECISION_KINDS[x?.kind]).slice(0, 25);
   console.log(recent.length ? '\nПоследние решения (новые сверху):' : '\nЖурнал решений пока пуст.');
   for (const x of recent) console.log(`  ${fmtDate(x.t)}  ${coinOf(x.sym).padEnd(6)} ${DECISION_KINDS[x.kind].emoji} ${DECISION_KINDS[x.kind].text}${x.n > 1 ? ` (×${x.n})` : ''} — ${x.why}`);
@@ -572,9 +579,11 @@ const ACT_RU = { BUY: 'ПОКУПКА', SELL: 'ПРОДАЖА' };
 const zoneTxt = (p) => `${fmt(p.zone[0])}–${fmt(p.zone[1])}`;
 // вход на ретесте (TRADE_ENTRY=retest): ждём цену у уровня и подтверждение, а не входим вдогонку
 const retestOn = (z) => cfg.trade.entry === 'retest' && !!z?.level;
-const levelTxt = (L) => levelStr(L);
+const levelTxt = (L) => (L?.role === 'range' ? `${levelStr(L)} (граница боковика)` : levelStr(L));
+const tagOf = (z) => (isRangeZone(z) ? '↔️' : '🎯');
 function waitText(r, atLevel) {
   const p = r.plan, base = `сигнал ${ACT_RU[p.dir]} подтверждён (оценка ${sgn(r.score)})`;
+  if (r.isRange) return `${r.reason}${atLevel ? ` (цена ${fmt(r.price)} уже у границы)` : ` — жду цену у границы ${levelStr(p.level)}`}`;
   if (!retestOn(p)) return `${base}, цена ${fmt(r.price)} ещё не в зоне ${zoneTxt(p)} — жду`;
   return atLevel ? `${base}, цена ${fmt(r.price)} у уровня ${levelTxt(p.level)} — жду подтверждения ретеста (закрытия 15-минутной свечи ${p.dir === 'BUY' ? 'вверх' : 'вниз'} от уровня)`
     : `${base} — вдогонку не вхожу (цена ${fmt(r.price)}), жду ретест: ${levelText(p.level, p.dir)}`;
@@ -683,8 +692,10 @@ async function handleResult(r, { zone = false } = {}) {
     else if (!inZone) {
       // точки входа ещё нет — ждём: при входе на ретесте — цену у уровня и подтверждение, иначе — цену в зоне;
       // письмо, SMS и сделка — в этот момент, если свежий анализ подтвердит вход
+      const wasRange = isRangeZone(state.zones[sym]) && state.zones[sym].dir === r.action;
       armZone(r, { setup: true, touched: retestOn(r.plan) && atLevel });
       note(sym, 'wait', waitText(r, atLevel), { dir: r.action, key: 'wait' });
+      if (r.isRange && !wasRange) console.log(`↔️ ${coinOf(sym)}: ${waitText(r, atLevel)}`);
       tgPost('paid', 'setup', TG.setupPost(r), { silent: true });
     } else if (trader.enabled && RETRY_CODES.has(r.exec?.code)) keepForRetry(r, now);
     else delete state.zones[sym];
@@ -792,6 +803,7 @@ function dropZone(sym, why, { log = true } = {}) {
   if (!z) return;
   delete state.zones[sym];
   saveState();
+  if (log && isRangeZone(z)) console.log(`↔️ ${coinOf(sym)}: ожидание у границы боковика снято — ${why}`);
   if (log) note(sym, 'zone-off', `${z.dir === 'BUY' ? 'покупка' : 'продажа'} ${fmt(z.low)}–${fmt(z.high)}: ${why}`, { dir: z.dir, key: reasonKey(why) });
 }
 
@@ -914,7 +926,7 @@ async function zoneTrigger(sym, z) {
     if (state.zones[sym] !== z) return;
     const d = retestEntry(z, r, { m15, h1: b.candles.h1, risk: cfg.risk, ...rule });
     if (d.conf?.ext != null) z.touchExt = d.conf.ext;
-    console.log(`🎯 ${coinOf(sym)}: ретест уровня ${levelTxt(z.level)} — ${d.kind === 'entry' ? `вход подтверждён: ${d.why}` : d.why}`);
+    console.log(`${tagOf(z)} ${coinOf(sym)}: ${isRangeZone(z) ? 'граница боковика' : 'ретест уровня'} ${levelTxt(z.level)} — ${d.kind === 'entry' ? `вход подтверждён: ${d.why}` : d.why}`);
     if (d.kind === 'fail') { dropZone(sym, d.why); return; }
     if (d.kind === 'wait' || d.kind === 'away') {
       note(sym, 'retest', d.why, { dir: z.dir, key: d.kind === 'away' ? 'retest-away' : d.conf?.below ? 'retest-below' : 'retest-wait' });
@@ -950,7 +962,7 @@ function retestTick(sym, z, tick) {
   const step = retestStep(z, tick), L = z.level;
   if (step === 'touch') {
     saveState();
-    console.log(`🎯 ${coinOf(sym)}: цена ${fmt(z.touchExt)} дошла до уровня ${levelTxt(L)} — жду подтверждения ретеста`);
+    console.log(`${tagOf(z)} ${coinOf(sym)}: цена ${fmt(z.touchExt)} дошла до ${isRangeZone(z) ? `${z.dir === 'BUY' ? 'нижней' : 'верхней'} границы боковика ${levelStr(L)}` : `уровня ${levelTxt(L)}`} — жду подтверждения: разворота 15-минутной свечи`);
     note(sym, 'retest', `цена дошла до уровня: ${levelText(L, z.dir)} — жду подтверждения: закрытия 15-минутной свечи ${z.dir === 'BUY' ? 'вверх' : 'вниз'} от уровня`, { dir: z.dir, key: 'retest-touch' });
   } else if (step === 'away') {
     saveState();
@@ -1378,7 +1390,12 @@ do {
   lastCycleAt = Date.now();
   cycles++;
   // короткий отчёт о работе — для команды --why (видно, что программа жива и с какими настройками работает)
-  if (!once) { state.status = { at: lastCycleAt, version: VERSION, startedAt, cycles, coins: coins.length, confirmPolls: cfg.signal.confirmPolls, trading: tradingInfo(), stocks: stocksStatus() }; saveState(); }
+  if (!once) {
+    // боковик по монетам — для --why
+    const ranges = [...results.entries()].filter(([k, r]) => !k.includes('@') && r?.range).map(([k, r]) => ({ sym: k, tag: R.rangeTag(r), why: r.range.ok ? null : r.range.why, regime: r.regime?.label }));
+    state.status = { at: lastCycleAt, version: VERSION, startedAt, cycles, coins: coins.length, confirmPolls: cfg.signal.confirmPolls, trading: tradingInfo(), stocks: stocksStatus(), ranges, rangeOn: cfg.range.enabled && !cfg.range.autoOff };
+    saveState();
+  }
   if (!once && ((firstCycle && digestNow) || digestDue())) {
     state.digestDay = new Date().toLocaleDateString('sv-SE');
     saveState();
