@@ -297,6 +297,7 @@ function breadthOf(kind) {
 }
 let lastCycleAt = 0, cycles = 0;
 const startedAt = Date.now();
+let rangeLogAt = 0; // когда в журнал последний раз писалась сводка по боковику
 
 // о чём писать на почту — EMAIL_EVENTS (по умолчанию: цена в зоне входа, сделки, киты, сбои); остальное — в панели
 const wants = (cat) => cfg.notify.events.includes(cat);
@@ -1337,6 +1338,7 @@ if (!once) {
     const limit = Math.max(cfg.pollSeconds * 10, 15 * 60) * 1000;
     if (since > limit) { console.error(`Сторож: анализ не завершался ${Math.round(since / 60e3)} мин — перезапуск`); try { journal.save(); } catch { /* ignore */ } process.exit(1); }
   }, 60e3).unref();
+  console.log(`Crypto Watcher ${VERSION} · вход: ${cfg.trade.entry === 'retest' ? 'на ретесте' : cfg.trade.entry} · ↔️ торговля в боковике: ${cfg.range.enabled ? cfg.trade.entry === 'retest' ? 'включена' : 'выключена (работает только при TRADE_ENTRY=retest)' : 'выключена (RANGE_TRADES=0)'}`);
   console.log(`Уведомления: ${notifier.channels({ masked: true }).join(', ')}`);
   if (tgOn) console.log(`📣 Telegram: ${[tgChan.paid && `платный ${tgChan.paid} (все сигналы и разбор)`, tgChan.free && `бесплатный ${tgChan.free} (${cfg.telegram.freeEvery > 0 ? cfg.telegram.freeEvery === 1 ? 'все сигналы кратко' : `каждый ${cfg.telegram.freeEvery}-й сигнал кратко` : 'только итоги недели'})`].filter(Boolean).join(', ')}`);
   else if (cfg.telegram.paid || cfg.telegram.free) console.log('📣 Telegram: каналы заданы, но нет TELEGRAM_BOT_TOKEN — в каналы ничего не уходит');
@@ -1395,6 +1397,15 @@ do {
     const ranges = [...results.entries()].filter(([k, r]) => !k.includes('@') && r?.range).map(([k, r]) => ({ sym: k, tag: R.rangeTag(r), why: r.range.ok ? null : r.range.why, regime: r.regime?.label }));
     state.status = { at: lastCycleAt, version: VERSION, startedAt, cycles, coins: coins.length, confirmPolls: cfg.signal.confirmPolls, trading: tradingInfo(), stocks: stocksStatus(), ranges, rangeOn: cfg.range.enabled && !cfg.range.autoOff };
     saveState();
+    // сводка по боковику — в журнал после первого цикла и раз в час (на хостинге без командной строки это единственный способ её увидеть)
+    if (ranges.length && Date.now() - rangeLogAt >= 3600e3) {
+      rangeLogAt = Date.now();
+      const found = ranges.filter((x) => x.tag);
+      console.log(`↔️ Боковик сейчас у ${found.length} из ${ranges.length}${found.length ? ':' : ' — рынок движется, сделок от границ сейчас не будет'}${cfg.range.autoOff ? ' (сделки от границ выключены самопроверкой)' : ''}`);
+      for (const x of found) console.log(`   ${coinOf(x.sym).padEnd(6)} ${x.tag}`);
+      const none = ranges.filter((x) => !x.tag);
+      if (none.length) console.log(`   нет боковика: ${none.map((x) => `${coinOf(x.sym)} — ${(x.why ?? '').split(/ — |: | \(/)[0]}`).join('; ')}`);
+    }
   }
   if (!once && ((firstCycle && digestNow) || digestDue())) {
     state.digestDay = new Date().toLocaleDateString('sv-SE');
