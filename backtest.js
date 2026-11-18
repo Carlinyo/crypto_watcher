@@ -27,10 +27,9 @@ const { Binance } = await import('./lib/binance.js');
 const { analyze, decide } = await import('./lib/analyzer.js');
 const { fmt } = await import('./lib/format.js');
 const { priceInZone, zoneEntry } = await import('./lib/policy.js');
-const { touches, isConfirmation, retestPlan } = await import('./lib/entry.js');
+const { touches, isConfirmation, retestPlan, freshPlanFor, entryCheck, isRangeZone } = await import('./lib/entry.js');
 const { STOCK_CANDIDATES, tradedOnly } = await import('./lib/stocks.js');
 const { simulateAccount, accountText } = await import('./lib/portfolio.js');
-const { executionCosts, lastClosedIndex, tradesIn, walkForward } = await import('./lib/backtest-metrics.js');
 const os = await import('node:os');
 const { MacroCalendar } = await import('./lib/calendar.js');
 const calendar = new MacroCalendar(path.join(dir, cfg.macro.file));
@@ -48,18 +47,6 @@ const compare = bool('compare');
 const fast = bool('fast');
 const jsonOut = flag('json', null);
 const quiet = bool('quiet');
-const useRange = bool('range');
-const noRange = bool('no-range');
-if (useRange || noRange) cfg.trade.range = useRange && !noRange;
-const costs = {
-  feePct: cfg.risk.feePct, spreadBps: Number(flag('spread-bps', 2)), slippageBps: Number(flag('slippage-bps', 2)),
-  fundingBps: Number(flag('funding-bps', 1)), tp1Share: cfg.trade.tp1Share,
-};
-if (!Number.isFinite(days) || days <= 0 || !Number.isInteger(step) || step <= 0 ||
-  !(baseThr > 0 && baseThr <= 1) ||
-  ![costs.feePct, costs.spreadBps, costs.slippageBps, costs.fundingBps].every((n) => Number.isFinite(n) && n >= 0)) {
-  throw new Error('Укажите положительный период и шаг, неотрицательные комиссии и издержки');
-}
 // самопроверка идёт рядом с работающей программой — не отнимаем у неё процессор, а если на сервере кончится память,
 // система должна остановить бэктест, а не программу (Linux: чем больше oom_score_adj, тем раньше процесс под снос)
 if (quiet) {
@@ -73,9 +60,6 @@ const stocksMode = bool('stocks');
 cfg.signal.threshold = baseThr;
 const binance = new Binance(cfg);
 const DAY = 86400e3, H = 3600e3;
-const periodEnd = Date.now();
-const periodStart = periodEnd - days * DAY;
-const holdoutStart = periodStart + Math.floor(days * DAY * 0.8);
 await binance.loadFuturesInfo().catch(() => null); // какие символы — фьючерсы на акции
 
 let symbols = args.map((s) => s.toUpperCase());
@@ -104,7 +88,7 @@ async function history(symbol, interval, nDays, market = 'spot') {
     const st = fs.statSync(file);
     if (Date.now() - st.mtimeMs < 6 * H) return JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch { /* нет кэша */ }
-  const rows = await binance.klinesHistory(symbol, interval, periodEnd - nDays * DAY, periodEnd, market);
+  const rows = await binance.klinesHistory(symbol, interval, Date.now() - nDays * DAY, Date.now(), market);
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.tmp`;
@@ -114,10 +98,15 @@ async function history(symbol, interval, nDays, market = 'spot') {
   return rows;
 }
 
+// последняя закрытая к моменту t свеча (указатель двигается только вперёд)
+function cursor(arr) {
+  let k = -1;
+  return (t) => { while (k + 1 < arr.length && arr[k + 1].closeTime <= t) k++; return k; };
+}
+
 function analyzeAt(sym, data, i, price, btcAt) {
   const t = data.h1[i].closeTime;
-  // Запросы ретеста возвращаются назад по времени после расчёта основной серии.
-  const i4 = lastClosedIndex(data.h4, t), iD = lastClosedIndex(data.d1, t), i15 = data.m15 ? lastClosedIndex(data.m15, t) : -1;
+  const i4 = data.c4(t), iD = data.cD(t), i15 = data.c15 ? data.c15(t) : -1;
   const bundle = {
     symbol: sym, kind: data.kind, price, closedOnly: true, now: t,
     candles: {
@@ -133,7 +122,7 @@ function analyzeAt(sym, data, i, price, btcAt) {
   return analyze(bundle, acfg);
 }
 
-const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.plan, planLegacy: r.planLegacy, core: r.core, trend: r.blocks.trend.score, atr: r.stats.atr });
+const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.isRange ? r.planTrend ?? r.plan : r.plan, planLegacy: r.planLegacy, core: r.core, range: r.range, trend: r.blocks.trend.score, atr: r.stats.atr });
 
 // ── симуляция сделок по сохранённым оценкам ───────────────────────────────
 // Способы входа (--entry, как TRADE_ENTRY; --compare — все три на одних данных):
@@ -145,9 +134,13 @@ const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: 
 //   signal — сильный сигнал — вход сразу, где бы ни была цена.
 // Вход по свежему анализу — если оценка в ту же сторону не слабее 70% порога, прибыль/риск от MIN_RR и нет запретов.
 function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
-  const c = { ...cfg, signal: { ...cfg.signal, threshold: thr }, trade: { ...cfg.trade, entry: mode } };
+  // norange — вход на ретесте без сделок в боковике (для сравнения: что дают сделки от границ боковика)
+  const noRange = mode === 'norange';
+  if (noRange) mode = 'retest';
+  const c = { ...cfg, signal: { ...cfg.signal, threshold: thr }, trade: { ...cfg.trade, entry: mode }, range: { ...cfg.range, enabled: cfg.range.enabled && !noRange } };
   const legacy = mode !== 'retest';
   const planOf = (x) => (legacy ? x.planLegacy ?? x.plan : x.plan);
+  const feePct = (cfg.risk.feePct ?? 0.2) / 100;
   const expire = cfg.journal.expireHours;
   const rule = { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio };
   const trades = [];
@@ -171,30 +164,21 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
     return out.length ? out : [bar];
   };
 
-  const close = (j, price, why, exitAt = data.h1[j].closeTime) => {
+  const close = (j, price, why) => {
     const s = open.side === 'BUY' ? 1 : -1;
     const risk = Math.abs(open.entry - open.initStop) || 1e-12;
     const rOf = (p) => ((p - open.entry) * s) / risk;
-    const grossR = open.tp1 ? costs.tp1Share * rOf(open.t1) + (1 - costs.tp1Share) * rOf(price) : rOf(price);
-    const t0 = open.entryAt, t1 = Math.max(t0, exitAt);
-    const fees = executionCosts({ ...open, target1: open.t1, exit: price, t0, t1, why }, data.costs);
-    const r = grossR - Object.values(fees).reduce((sum, value) => sum + value, 0) / risk;
-    trades.push({ ...open, exitIdx: j, exitAt: t1, exit: price, why, grossR, fees, r });
+    let r = open.tp1 ? 0.5 * rOf(open.t1) + 0.5 * rOf(price) : rOf(price);
+    r -= (open.entry * feePct) / risk;
+    trades.push({ ...open, exitIdx: j, exit: price, why, r });
     open = null;
   };
-  const openTrade = (j, side, entry, plan, via, rec, entryAt = data.h1[j].time) => {
-    open = { sym, side, entryIdx: j, entryAt, entry, stop: plan.stop, initStop: plan.stop, t1: plan.t1, t2: plan.t2, tp1: false, via, rangeEntry: plan.entryType === 'range', regime: rec.regime.key, score: rec.score };
+  const openTrade = (j, side, entry, plan, via, rec) => {
+    open = { sym, side, entryIdx: j, entry, stop: plan.stop, initStop: plan.stop, t1: plan.t1, t2: plan.t2, tp1: false, via, regime: rec.regime.key, score: rec.score };
     // если вход заметно хуже расчётного — стоп/цели остаются по плану (как в реальной жизни)
     if ((side === 'BUY' && entry <= plan.stop) || (side === 'SELL' && entry >= plan.stop)) open = null;
-    if (open?.rangeEntry) {
-      const sign = side === 'BUY' ? 1 : -1;
-      const fee = entry * costs.feePct / 100;
-      const rr = ((plan.t1 - entry) * sign - fee) / ((entry - plan.stop) * sign + fee);
-      if (entry < plan.zone[0] || entry > plan.zone[1] || rr < rule.minRR) open = null;
-    }
   };
-  const arm = (j, rec) => {
-    const p = planOf(rec);
+  const arm = (j, rec, p = planOf(rec)) => {
     // идёт ретест (цена у уровня) — уровень и касание не меняются при пересчёте, как у работающей программы
     if (zone && zone.level && zone.touched != null && zone.dir === p.dir) return;
     const level = legacy ? null : p.level;
@@ -208,12 +192,12 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
     if (open && j >= open.entryIdx) {
       const buy = open.side === 'BUY';
       const fav = buy ? bar.high : bar.low, adv = buy ? bar.low : bar.high;
-      if (buy ? adv <= open.stop : adv >= open.stop) close(j, buy ? Math.min(open.stop, bar.open) : Math.max(open.stop, bar.open), open.trailed ? 'trail' : open.tp1 ? 'breakeven' : open.be ? 'be' : 'stop');
+      if (buy ? adv <= open.stop : adv >= open.stop) close(j, open.stop, open.trailed ? 'trail' : open.tp1 ? 'breakeven' : open.be ? 'be' : 'stop');
       else {
         // прибыль в один риск (TRADE_BE_AT_R) — стоп в безубыток ещё до цели 1, как у работающей программы
         const beR = cfg.trade.beAtR * Math.abs(open.entry - open.initStop);
         if (!open.tp1 && !open.be && beR > 0 && (buy ? fav >= open.entry + beR : fav <= open.entry - beR)) { open.be = true; open.stop = open.entry; open.safeIdx ??= j; }
-        if (!open.tp1 && (buy ? fav >= open.t1 : fav <= open.t1)) { open.tp1 = true; open.tp1At = bar.closeTime; open.stop = open.entry; open.safeIdx ??= j; }
+        if (!open.tp1 && (buy ? fav >= open.t1 : fav <= open.t1)) { open.tp1 = true; open.stop = open.entry; open.safeIdx ??= j; }
         if (open && open.tp1 && (buy ? fav >= open.t2 : fav <= open.t2)) close(j, open.t2, 'tp2');
         else if (open && open.tp1 && !open.trailed && (buy ? fav >= (open.t1 + open.t2) / 2 : fav <= (open.t1 + open.t2) / 2)) { open.trailed = true; open.stop = open.t1; }
         if (open && j - open.entryIdx >= expire) close(j, bar.close, 'expired');
@@ -236,11 +220,12 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
             continue;
           }
           const px = k.close, rz = freshAt(j, px), d = dec(rz);
-          if (cfg.trade.range && rz.core.range) { zone = null; break; }
-          const plan = retestPlan(planOf(rz), zone, { price: px, ext: zone.ext, atr: rz.atr, stopMult: rz.regime.stopMult ?? 1, risk: cfg.risk });
-          const res = zoneEntry(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, plan }, rule);
+          const base = freshPlanFor(zone, { plan: planOf(rz), core: c.range.enabled ? rz.core : { ...rz.core, range: null } });
+          if (!base) { zone = null; break; } // боковик больше не подтверждается
+          const plan = retestPlan(base, zone, { price: px, ext: zone.ext, atr: rz.atr, stopMult: rz.regime.stopMult ?? 1, risk: cfg.risk });
+          const res = entryCheck(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, rangeVetoes: d.rangeVetoes }, plan, rule);
           if (res.ok) {
-            openTrade(j, zone.dir, px, plan, L.role === 'breakout' ? 'ретест' : 'отскок', rz, k.closeTime);
+            openTrade(j, zone.dir, px, plan, { breakout: 'ретест', range: 'боковик' }[L.role] ?? 'отскок', rz);
             lastSig = j;
             zone = null;
             // остаток часа после входа — только стоп (консервативно)
@@ -257,7 +242,6 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
         if (hit) {
           const px = zone.dir === 'BUY' ? Math.min(bar.open, zone.high) : Math.max(bar.open, zone.low);
           const rz = freshAt(j, px);
-          if (cfg.trade.range && rz.core.range) { zone = null; continue; }
           const d = dec(rz);
           const res = zoneEntry(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, plan: planOf(rz) }, rule);
           if (res.ok) {
@@ -275,26 +259,28 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
     if (zone && j > zone.until) zone = null;
     const rec = recs.get(j);
     if (!rec) continue;
-    const d = dec(rec), p = d.rangeEntry ? rec.core.range.plan : planOf(rec);
-    if (cfg.trade.range && rec.core.range) zone = null;
+    const d = dec(rec), p = d.plan ?? planOf(rec);
+    // боковик сломан — его зона больше не нужна
+    if (zone && isRangeZone(zone) && rec.range?.broken) zone = null;
     if (d.action === 'BUY' || d.action === 'SELL') {
       if (open && open.side === d.action) continue;
-      // подтверждённый сигнал против открытой сделки — выход, не дожидаясь стопа (TRADE_EXIT_ON_REVERSAL)
-      if (open && !cfg.trade.exitOnReversal) continue;
+      // подтверждённый сигнал против открытой сделки — выход, не дожидаясь стопа (TRADE_EXIT_ON_REVERSAL);
+      // сделка от границы боковика открытую сделку не закрывает
+      if (open && (!cfg.trade.exitOnReversal || d.isRange)) continue;
       if (open) close(j, bar.close, 'reversed');
       const inZone = priceInZone({ dir: p.dir, low: p.zone[0], high: p.zone[1], atr: rec.atr }, bar.close);
-      if (d.rangeEntry || mode === 'signal' || (mode === 'touch' && inZone)) {
-        if (d.rangeEntry && ((!cfg.trade.shorts && d.action === 'SELL') || d.confidence < cfg.trade.minConfidence)) continue;
-        if (j - lastSig >= 2 && j + 1 < data.h1.length) { openTrade(j + 1, d.action, data.h1[j + 1].open, p, d.rangeEntry ? 'боковик' : 'сигнал', rec); lastSig = j; zone = null; }
+      if (mode === 'signal' || (mode === 'touch' && inZone)) {
+        if (j - lastSig >= 2 && j + 1 < data.h1.length) { openTrade(j + 1, d.action, data.h1[j + 1].open, p, 'сигнал', rec); lastSig = j; zone = null; }
       } else {
-        arm(j, rec);
+        arm(j, rec, p);
         // цена уже у уровня — касание засчитано, подтверждение — по следующим 15-минутным свечам
         if (zone.level && inZone && zone.touched == null) { zone.touched = bar.time; zone.ext = p.dir === 'BUY' ? bar.low : bar.high; }
       }
     } else if (d.action.startsWith('WATCH') && !open) {
-      if (d.zoneOk) arm(j, rec);
-      else if (!(zone && zone.level && zone.touched != null && zone.dir === p.dir)) zone = null;
-    } else if (d.action === 'NEUTRAL' && zone && Math.abs(rec.score) < d.threshold * 0.3) zone = null;
+      const keepRange = zone && isRangeZone(zone) && rec.range?.ok;
+      if (d.zoneOk) { if (!(keepRange && zone.dir === p.dir)) arm(j, rec, p); }
+      else if (!(zone && zone.level && zone.touched != null && zone.dir === p.dir) && !keepRange) zone = null;
+    } else if (d.action === 'NEUTRAL' && zone && Math.abs(rec.score) < d.threshold * 0.3 && !(isRangeZone(zone) && rec.range?.ok)) zone = null;
   }
   if (open) close(data.h1.length - 1, data.h1[data.h1.length - 1].close, 'открыта на конец');
   return trades;
@@ -315,7 +301,7 @@ function stats(trades) {
 
 const pad = (s, n) => String(s).padStart(n);
 const pf = (x) => (x == null ? '—' : x === Infinity ? '∞' : x.toFixed(2));
-const perDay = (n) => (n / reportDays < 0.1 ? (n / reportDays).toFixed(2) : (n / reportDays).toFixed(1));
+const perDay = (n) => (n / days < 0.1 ? (n / days).toFixed(2) : (n / days).toFixed(1));
 const row = (name, s) => `${name.padEnd(12)}${pad(s.n, 7)}${pad(perDay(s.n), 8)}${pad(s.winRate == null ? '—' : `${(s.winRate * 100).toFixed(0)}%`, 8)}${pad(s.tp1 == null ? '—' : `${(s.tp1 * 100).toFixed(0)}%`, 8)}${pad(s.avgR == null ? '—' : s.avgR.toFixed(2), 8)}${pad(s.sumR.toFixed(1), 9)}${pad(pf(s.pf), 7)}${pad(s.maxDD.toFixed(1), 10)}`;
 const HEAD = `${'монета'.padEnd(12)}${pad('сделок', 7)}${pad('в день', 8)}${pad('успех', 8)}${pad('цель1', 8)}${pad('ср. R', 8)}${pad('сумма R', 9)}${pad('PF', 7)}${pad('просадка', 10)}`;
 const WHY_RU = { stop: 'стоп', breakeven: 'цель 1 → безубыток', be: 'безубыток до цели 1', trail: 'цель 1 → подтянутый стоп', tp2: 'цель 2', expired: 'истекло время', reversed: 'обратный сигнал' };
@@ -326,10 +312,8 @@ const REG_RU = { trend_up: 'восх. тренд', trend_down: 'нисх. тре
 // так бэктест укладывается в память контейнера рядом с работающей программой.
 say(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr} | вход ${compare ? 'всеми тремя способами' : ENTRY_MODES[entryMode]}${fast ? ' | без 15m (подтверждение ретеста — по часовым свечам)' : ''}`);
 say('Загрузка истории (кэшируется в data/history)…');
-const thresholds = grid ? [...new Set([0.25, 0.28, 0.3, 0.33, 0.36, 0.4, 0.45, 0.5, baseThr])].sort((a, b) => a - b) : [baseThr];
-const reportEnd = grid ? holdoutStart : periodEnd;
-const reportDays = (reportEnd - periodStart) / DAY;
-const CMP = [['retest', 'ретест'], ['touch', 'касание 2.7'], ['signal', 'по сигналу']];
+const thresholds = grid ? [0.25, 0.28, 0.3, 0.33, 0.36, 0.4, 0.45, 0.5] : [baseThr];
+const CMP = [['retest', 'ретест'], ['touch', 'касание 2.7'], ['signal', 'по сигналу'], ['norange', 'без боковика']];
 const runs = new Map(thresholds.map((thr) => [thr, []]));   // порог → сделки (способ входа — entryMode)
 const cmpRuns = new Map(CMP.map(([m]) => [m, []]));         // способ входа → сделки при основном пороге
 const perSym = [];                                            // [монета, сделки] при основном пороге
@@ -338,7 +322,6 @@ const btcScores = new Map();
 let btcData = null;
 const t0 = Date.now();
 const done = [];
-const fundingSources = {};
 
 for (const sym of symbols) {
   let data;
@@ -349,28 +332,18 @@ for (const sym of symbols) {
     const [h1, h4, d1, m15] = (await Promise.all([
       history(sym, '1h', days + (stock ? 120 : 25), mk), history(sym, '4h', days + 90, mk), history(sym, '1d', days + 400, mk),
       fast ? Promise.resolve(null) : history(sym, '15m', days + 5, mk),
-    ])).map((x) => (x ? keep(x.filter((bar) => bar.closeTime <= periodEnd)) : x));
-    data = { h1, h4, d1, m15, kind: stock ? 'stock' : 'crypto' };
+    ])).map((x) => (x ? keep(x) : x));
+    data = { h1, h4, d1, m15, c4: cursor(h4), cD: cursor(d1), c15: m15 ? cursor(m15) : null, kind: stock ? 'stock' : 'crypto' };
   } catch (e) { console.error(`${sym}: не удалось загрузить историю — ${e.message}`); continue; }
   const warm = stock ? 250 : 500;
   if (data.h1.length < warm + 100) { console.error(`${sym}: мало истории (${data.h1.length} ч с торгами) — пропускаю`); continue; }
-  const first = data.h1.findIndex((c) => c.time >= periodStart);
-  if (first < 0) { console.error(`${sym}: нет свечей в выбранном периоде`); continue; }
-  data.start = Math.max(warm, first);
-  const futures = stock ? { symbol: sym, mult: 1 } : binance.futuresOf(sym);
-  const funding = futures ? await binance.fundingHistory(futures.symbol, periodStart, periodEnd).catch((e) => {
-    console.error(`${sym}: нет истории фандинга, использую оценку — ${e.message}`);
-    return null;
-  }) : null;
-  const payments = funding?.map((x) => ({
-    time: +x.fundingTime, rate: +x.fundingRate, price: +x.markPrice / (futures.mult ?? 1),
-  })).filter((x) => Number.isFinite(x.time) && Number.isFinite(x.rate)).sort((a, b) => a.time - b.time);
-  data.costs = { ...costs, funding: payments?.length ? payments : null };
-  fundingSources[sym] = data.costs.funding ? 'binance' : 'estimate';
+  const startT = Date.now() - days * DAY;
+  data.start = Math.max(warm, data.h1.findIndex((c) => c.time >= startT));
   if (!stock && sym !== 'BTCUSDT' && btcData) {
     const btcH1 = btcData.h1;
+    const cb = cursor(btcH1);
     data.btcAt = (t) => {
-      const k = lastClosedIndex(btcH1, t);
+      const k = cb(t);
       if (k < 60) return null;
       const s = btcScores.get(btcH1[k].closeTime);
       return { h1: btcH1.slice(Math.max(0, k - 499), k + 1), trend: s?.trend ?? 0, score: s?.score ?? 0 };
@@ -386,39 +359,30 @@ for (const sym of symbols) {
     if (++n && !quiet && Date.now() - lastLog > 5000) { lastLog = Date.now(); process.stdout.write(`  ${sym}: ${Math.round((n / total) * 100)}%\r`); }
   }
   // сделки с временем входа и выхода, расстоянием до стопа и моментом, когда стоп перенесён в безубыток
+  const mid = data.start + Math.floor((data.h1.length - data.start) / 2);
   const stamp = (tr) => tr.map((t) => ({
-    ...t, kind: data.kind, t0: t.entryAt, t1: t.exitAt,
+    ...t, kind: data.kind, t0: data.h1[t.entryIdx].time, t1: data.h1[t.exitIdx].closeTime ?? data.h1[t.exitIdx].time + H,
     safeAt: t.safeIdx != null ? data.h1[t.safeIdx].closeTime ?? data.h1[t.safeIdx].time + H : null,
-    stopPct: Math.abs(t.entry - t.initStop) / t.entry,
+    stopPct: Math.abs(t.entry - t.initStop) / t.entry, second: t.entryIdx >= mid,
   }));
   const zoneCache = new Map();
   for (const thr of thresholds) {
     const tr = stamp(simulate(sym, data, recs, thr, zoneCache));
     runs.get(thr).push(...tr);
-    if (thr === mainThr) {
-      const visible = tradesIn(tr, periodStart, reportEnd);
-      perSym.push([sym, visible]); cmpRuns.get(entryMode).push(...visible);
-    }
+    if (thr === mainThr) { perSym.push([sym, tr]); cmpRuns.get(entryMode).push(...tr); }
   }
-  if (compare) for (const [m] of CMP) if (m !== entryMode) {
-    cmpRuns.get(m).push(...tradesIn(stamp(simulate(sym, data, recs, mainThr, zoneCache, m)), periodStart, reportEnd));
-  }
+  if (compare) for (const [m] of CMP) if (m !== entryMode) cmpRuns.get(m).push(...stamp(simulate(sym, data, recs, mainThr, zoneCache, m)));
   if (sym === 'BTCUSDT') btcData = { h1: data.h1 }; // альтам нужен только часовой график биткоина
   done.push(sym);
   say(`  ${sym}: проанализировано ${n} точек`);
 }
 
-const summary = thresholds.map((thr) => {
-  const trades = tradesIn(runs.get(thr), periodStart, reportEnd);
-  return { thr, stats: stats(trades), trades };
-});
+const summary = thresholds.map((thr) => ({ thr, stats: stats(runs.get(thr)), trades: runs.get(thr) }));
 const main = summary.find((s) => s.thr === mainThr);
-say(`\nРезультаты при пороге ${main.thr}${grid ? ' на первых 80% периода' : ''}\n${HEAD}`);
-say(`Издержки: комиссия ${costs.feePct}% за оборот вход–выход, спред ${costs.spreadBps} б.п., проскальзывание ${costs.slippageBps} б.п. за рыночную сторону.`);
-say(`Фандинг: история Binance для ${Object.values(fundingSources).filter((x) => x === 'binance').length} из ${done.length} инструментов, для остальных оценка ${costs.fundingBps} б.п. за 8 ч.`);
+say(`\nРезультаты при пороге ${main.thr} (комиссия ${cfg.risk.feePct}% учтена):\n${HEAD}`);
 for (const [sym, t] of perSym) say(row(sym.replace(/USDT$/, ''), stats(t)));
 say(row('ИТОГО', main.stats));
-say(`В среднем ${perDay(main.stats.n)} сделки в день по всем монетам (${(main.stats.n / reportDays / Math.max(1, perSym.length)).toFixed(2)} на монету).`);
+say(`В среднем ${perDay(main.stats.n)} сделки в день по всем монетам (${(main.stats.n / days / Math.max(1, perSym.length)).toFixed(2)} на монету).`);
 const group = (key) => { const g = {}; for (const t of main.trades) (g[t[key]] ??= []).push(t); return g; };
 const byWhy = {};
 for (const t of main.trades) byWhy[t.why] = (byWhy[t.why] ?? 0) + 1;
@@ -450,30 +414,42 @@ if (compare) {
   } else say('\nСделок мало для вывода — увеличьте период (--days 180) или добавьте монеты.');
 }
 
-const midpoint = (periodStart + reportEnd) / 2;
-const halfStats = (tr) => ({ first: stats(tradesIn(tr, periodStart, midpoint)), second: stats(tradesIn(tr, midpoint, reportEnd)) });
-const validation = grid ? walkForward(runs, { start: periodStart, end: periodEnd, stats }) : null;
+// половины периода: держится ли результат на новых данных
+const halfStats = (tr) => ({ first: stats(tr.filter((t) => !t.second)), second: stats(tr.filter((t) => t.second)) });
 if (grid) {
-  say(`\nПеребор порога на первых 80% периода:\n${'порог'.padEnd(12)}${HEAD.slice(12)}`);
+  say(`\nПеребор порога:\n${'порог'.padEnd(12)}${HEAD.slice(12)}`);
   for (const s of summary) say(row(String(s.thr), s.stats));
-  const date = (at) => new Date(at).toISOString().slice(0, 10);
-  const printTest = (label, x) => {
-    const result = x.test ? `порог ${x.threshold}, ${x.test.n} сделок, ${x.test.sumR.toFixed(1)}R, PF ${pf(x.test.pf)}` : 'мало данных для выбора порога';
-    say(`${label} ${date(x.from)} — ${date(x.to)} · ${result}`);
-  };
-  validation.folds.forEach((x, i) => printTest(`Окно ${i + 1}`, x));
-  printTest('Финальная проверка', validation.holdout);
-  if (validation.recommended != null) say(`Порог ${validation.recommended} прошёл все три окна. Кандидат для демо: THRESHOLD=${validation.recommended}.`);
-  else say('Порог, прошедший все три окна, не подтверждён.');
+  const ok = summary.filter((s) => s.stats.n >= 10 && s.stats.pf != null && s.stats.pf >= 1.2);
+  const best = [...(ok.length ? ok : summary)].sort((a, b) => b.stats.sumR - a.stats.sumR)[0];
+  say(`\nЛучший итог за весь период: порог ${best.thr} (сумма ${best.stats.sumR.toFixed(1)}R, PF ${pf(best.stats.pf)}, сделок ${best.stats.n}).`);
+
+  // проверка на новых данных: подбираем порог по первой половине периода, проверяем на второй
+  const halves = summary.map((s) => ({ thr: s.thr, ...halfStats(s.trades) }));
+  const okIn = halves.filter((h) => h.first.n >= 5);
+  const pick = [...(okIn.length ? okIn : halves)].sort((a, b) => b.first.sumR - a.first.sumR)[0];
+  say(`\nПроверка на новых данных (подбор на первой половине периода, проверка на второй):`);
+  say(`${'порог'.padEnd(12)}${'1-я половина'.padStart(22)}${'2-я половина'.padStart(24)}`);
+  for (const h of halves) say(`${String(h.thr).padEnd(12)}${`${h.first.n} сд. ${h.first.sumR.toFixed(1)}R PF ${pf(h.first.pf)}`.padStart(22)}${`${h.second.n} сд. ${h.second.sumR.toFixed(1)}R PF ${pf(h.second.pf)}`.padStart(24)}`);
+  // честная проверка: прибыль на второй половине должна быть не случайной (PF ≥ 1.1 и хотя бы 5 сделок)
+  const pf2 = pick.second.pf ?? 0, pf1 = pick.first.pf ?? 0;
+  const holds = pick.second.n >= 5 && pick.second.sumR > 0 && pf2 >= 1.1;
+  const weaker = holds && pf1 !== Infinity && pf2 < 1 + (pf1 - 1) * 0.5;
+  say(`\nПорог ${pick.thr}, выбранный по первой половине, на второй: ${pick.second.n} сделок, ${pick.second.sumR.toFixed(1)}R, PF ${pf(pick.second.pf)} — ${!holds ? 'на новых данных не подтвердился ✗ (возможно, подгонка под историю)' : weaker ? 'держится, но заметно слабее, чем на истории (часть результата — подгонка)' : 'результат держится ✓'}.`);
+  // самый устойчивый порог: лучший худший PF из двух половин (по 10+ сделок в каждой)
+  const minPf = (h) => Math.min(h.first.pf ?? 0, h.second.pf ?? 0);
+  const both = halves.filter((h) => h.first.n >= 10 && h.second.n >= 10).sort((a, b) => minPf(b) - minPf(a));
+  const stable = both[0];
+  if (stable) say(`Устойчивее всего (работает в обеих половинах, по 10+ сделок): порог ${stable.thr} — PF ${pf(stable.first.pf)} и ${pf(stable.second.pf)}.`);
+  const def = cfg.signal.threshold;
+  if (stable && minPf(stable) >= 1.15) say(`Рекомендация: THRESHOLD=${stable.thr} в .env${stable.thr === def ? ' (это и есть значение по умолчанию)' : ''}.`);
+  else say(`Рекомендация: ни один порог не даёт устойчивого преимущества на этих данных — оставьте ${def} и проверьте на более длинном периоде (--days 365).`);
 }
 
-const slim = (t) => { const { safeIdx, ...x } = t; return { ...x, entryTime: t.t0, exitTime: t.t1 }; };
-const metadata = { days, reportDays, step, range: cfg.trade.range, costs, fundingSources, validation };
-const json = (value) => JSON.stringify(value, (_, x) => x === Infinity ? 999 : x, 1);
+const slim = (t) => { const { safeIdx, second, ...x } = t; return { ...x, entryTime: t.t0, exitTime: t.t1 }; };
 fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
 if (!jsonOut) {
   const out = path.join(dir, 'data', `backtest-${new Date().toISOString().slice(0, 10)}.json`);
-  fs.writeFileSync(out, json({ ...metadata, thresholds: summary.map((s) => ({ thr: s.thr, ...s.stats })), account, trades: main.trades.map(slim) }));
+  fs.writeFileSync(out, JSON.stringify({ days, step, thresholds: summary.map((s) => ({ thr: s.thr, ...s.stats })), account, trades: main.trades.map(slim) }, null, 1));
   say(`\nСделки сохранены в ${path.relative(dir, out)} · время ${Math.round((Date.now() - t0) / 1000)} с`);
 }
 if (main.trades.length) {
@@ -488,8 +464,8 @@ if (jsonOut) {
   const J = (st) => ({ ...st, pf: st.pf === Infinity ? 999 : st.pf });
   const mapStats = (g) => Object.fromEntries(Object.entries(g).map(([k, t]) => [k, J(stats(t))]));
   const result = {
-    ...metadata, at: Date.now(), fast, symbols: done, stocks: done.filter(isStockSym).length, threshold: main.thr, entry: entryMode, feePct: cfg.risk.feePct,
-    stats: J(main.stats), perDay: main.stats.n / reportDays, halves: (({ first, second }) => ({ first: J(first), second: J(second) }))(halfStats(main.trades)),
+    at: Date.now(), days, step, fast, symbols: done, stocks: done.filter(isStockSym).length, threshold: main.thr, entry: entryMode, feePct: cfg.risk.feePct,
+    stats: J(main.stats), perDay: main.stats.n / days, halves: (({ first, second }) => ({ first: J(first), second: J(second) }))(halfStats(main.trades)),
     byVia: mapStats(byVia), byRegime: mapStats(byRegime), bySymbol: Object.fromEntries(perSym.map(([sym, t]) => [sym, J(stats(t))])),
     compare: cmp ? Object.fromEntries(cmp.map((x) => [x.m, J(x.st)])) : null,
     account, risk: { riskPct: cfg.trade.riskPct, leverage: cfg.trade.leverage, maxPositions: cfg.trade.maxPositions },
@@ -497,8 +473,7 @@ if (jsonOut) {
   };
   const file = path.isAbsolute(jsonOut) ? jsonOut : path.join(dir, jsonOut);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, json(result));
-  fs.renameSync(tmp, file);
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(result));
+  fs.renameSync(`${file}.tmp`, file);
   say(`Итог записан в ${path.relative(dir, file)}`);
 }

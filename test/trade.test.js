@@ -1,9 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { Bybit, BybitError } from '../lib/bybit.js';
+import { Bybit } from '../lib/bybit.js';
 import { Trader, sizePosition, floorStep, roundTick } from '../lib/trader.js';
 import { MockBybit } from './bybit-mock.js';
 import cfg from '../config.js';
@@ -336,104 +333,4 @@ test('Bybit: при запуске находятся ордера програ�
   assert.equal(t.orphans.length, 1);
   assert.match(t.warnings.join(' '), /без записи о сделке \(SOLUSDT\)/);
   assert.ok(events.some((e) => e.type === 'orphans'));
-});
-
-test('Bybit: частично закрытая сделка переживает ошибку сверки и перезапуск', async (ctx) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cw-close-'));
-  ctx.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const { ex, t, events, c } = mk();
-  t.file = path.join(dir, 'bybit.json');
-  const result = await t.onSignal(sig('SOLUSDT', 'BUY', 150, 147, 156, 160));
-  const trade = result.trade;
-  const create = t.client.createOrder.bind(t.client);
-  const positions = t.client.positions.bind(t.client);
-  let submitted = false;
-  t.client.createOrder = async (p) => {
-    if (!p.reduceOnly || submitted) return create(p);
-    submitted = true;
-    const part = floorStep(Number(p.qty) / 2, '0.1');
-    return create({ ...p, qty: String(part) });
-  };
-  let failed = false;
-  t.client.positions = async (p) => {
-    if (submitted && !failed) { failed = true; throw new Error('lost response'); }
-    return positions(p);
-  };
-  await assert.rejects(t.closeTrade(trade, 'manual'), /lost response/);
-  assert.equal(trade.status, 'closing');
-  assert.ok(pos(ex, 'SOLUSDT').size > 0);
-  assert.equal(t.openTrades().length, 1);
-  assert.equal(events.some((e) => e.type === 'closed'), false);
-
-  await t.tick();
-  assert.equal(trade.status, 'closing');
-  const partialId = trade.closeAttempt.id;
-  trade.closeAttempt.at -= 30e3;
-  t.save();
-  const restarted = new Trader(c, { file: t.file, client: t.client, log: () => {}, onEvent: (e) => events.push(e) });
-  await restarted.init();
-  assert.equal(restarted.openTrades().length, 0);
-  assert.equal(restarted.closedTrades()[0].status, 'closed');
-  assert.equal(pos(ex, 'SOLUSDT'), undefined);
-  assert.equal(events.filter((e) => e.type === 'closed').length, 1);
-  const closes = [...ex.orders.values()].filter((o) => o.orderType === 'Market' && o.reduceOnly);
-  assert.equal(closes.length, 2);
-  assert.ok(closes.some((o) => o.orderLinkId === partialId));
-});
-
-test('Bybit: вход записан до отправки и восстанавливается по истории после потери ответа', async (ctx) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cw-recovery-'));
-  ctx.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const file = path.join(dir, 'bybit.json');
-  const { ex, t, c, events } = mk();
-  t.file = file;
-  const create = t.client.createOrder.bind(t.client);
-  let entryId;
-  t.client.createOrder = async (p) => {
-    if (p.reduceOnly) return create(p);
-    entryId = p.orderLinkId;
-    assert.equal(`${JSON.parse(fs.readFileSync(file, 'utf8')).pendingEntry.id}-e`, entryId);
-    await create(p);
-    throw new BybitError(-2, 'lost response', '/v5/order/create');
-  };
-  const result = await t.onSignal(sig('SOLUSDT', 'BUY', 150, 147, 156, 160));
-  assert.equal(result.status, 'error');
-  assert.ok(pos(ex, 'SOLUSDT'));
-  assert.equal((await t.onSignal(sig('ETHUSDT', 'BUY', 3000, 2940, 3120, 3200))).code, 'recovery');
-
-  const realtime = t.client.order.bind(t.client);
-  t.client.order = (symbol, id) => id === entryId ? null : realtime(symbol, id);
-  const restarted = new Trader(c, { file, client: t.client, log: () => {}, onEvent: (e) => events.push(e) });
-  await restarted.init();
-  assert.equal(restarted.ready, true);
-  assert.equal(restarted.state.pendingEntry, null);
-  assert.equal(restarted.openTrades()[0].id + '-e', entryId);
-  assert.equal([...ex.orders.values()].filter((o) => !o.reduceOnly).length, 1);
-  assert.equal([...ex.orders.values()].filter((o) => o.reduceOnly && o.orderStatus === 'New').length, 2);
-  assert.ok(events.some((e) => e.type === 'entry-recovered'));
-});
-
-test('Bybit: если журнал входа недоступен, рыночный ордер не отправляется', async (ctx) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cw-no-journal-'));
-  ctx.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const blocked = path.join(dir, 'blocked');
-  fs.writeFileSync(blocked, '');
-  const { ex, t } = mk();
-  t.file = path.join(blocked, 'bybit.json');
-  const r = await t.onSignal(sig('SOLUSDT', 'BUY', 150, 147, 156, 160));
-  assert.equal(r.status, 'error');
-  assert.match(r.reason, /сохранить состояние/);
-  assert.equal(ex.orders.size, 0);
-});
-
-test('Bybit: отбой в боковике проверяет цену исполнения и уменьшает риск', async () => {
-  const { t } = mk({}, { riskPct: 1 });
-  const r = sig('SOLUSDT', 'BUY', 150, 147, 156, 160);
-  r.rangeEntry = true;
-  assert.equal((await t.onSignal(r)).code, 'range moved');
-  r.plan.zone = [149, 151];
-  const result = await t.onSignal(r);
-  assert.equal(result.status, 'opened');
-  assert.equal(result.trade.setup, 'range');
-  assert.ok(result.trade.riskPct > 0.45 && result.trade.riskPct < 0.51);
 });

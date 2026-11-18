@@ -164,7 +164,6 @@ export default {
     // retest (по умолчанию; zone — то же самое) — вход на ретесте: цена вернулась к уровню, и 15-минутная свеча
     // подтвердила отскок; touch — как в 2.7: сразу при касании зоны; signal — сразу по сигналу, где бы ни была цена
     entry: ((v) => (v === 'zone' ? 'retest' : v))((clean(env.TRADE_ENTRY) || 'retest').toLowerCase()),
-    range: bool(env.TRADE_RANGE, false),
     apiKey: env.BYBIT_API_KEY || '',
     apiSecret: env.BYBIT_API_SECRET || '',
     baseUrl: env.BYBIT_URL || '',                     // по умолчанию — по режиму
@@ -208,6 +207,9 @@ export default {
   },
 
   digest: { enabled: bool(env.DIGEST, true), hour: num(env.DIGEST_HOUR, 9) },
+
+  // ↔️ торговля в боковике: покупка у нижней границы диапазона, продажа у верхней (только при TRADE_ENTRY=retest)
+  range: { enabled: bool(env.RANGE_TRADES, true) },
 
   // 📣 Telegram-каналы: платный — все сигналы с разбором, сопровождение, киты, резкие движения, обзор рынка;
   // бесплатный — каждый N-й сигнал кратко, его итоги и итоги недели. Бот должен быть администратором обоих каналов.

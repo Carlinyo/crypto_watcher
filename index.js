@@ -47,14 +47,14 @@ const { Journal } = await import('./lib/journal.js');
 const { Notifier } = await import('./lib/notifier.js');
 const { analyze } = await import('./lib/analyzer.js');
 const { selectUniverse } = await import('./lib/universe.js');
-const { startServer, scanHealthy } = await import('./lib/server.js');
-const { SelfTest } = await import('./lib/selftest.js');
+const { startServer } = await import('./lib/server.js');
+const { SelfTest, rangeVerdict } = await import('./lib/selftest.js');
 const { MacroCalendar } = await import('./lib/calendar.js');
 const { Trader, MODE_RU } = await import('./lib/trader.js');
 const { writeJsonAtomic, readJson } = await import('./lib/storage.js');
 const { InstanceLock } = await import('./lib/lock.js');
 const { priceInZone, zoneOf, signalEmail, resultProblem, zoneEntry, RETRY_CODES, TRADE_EVENT_CATEGORY, EMAIL_EVENT_NAMES } = await import('./lib/policy.js');
-const { retestStep, retestEntry, levelText, levelStr, M15 } = await import('./lib/entry.js');
+const { retestStep, retestEntry, levelText, levelStr, M15, isRangeZone } = await import('./lib/entry.js');
 const { Decisions, diagnose, reasonKey, DECISION_KINDS } = await import('./lib/decisions.js');
 const { loadStocks, stocksEnabled, stockSessionOpen, nextSessionOpen, sessionReason, stockZoneUntil, SESSION_RU, STOCK_CANDIDATES, tradedOnly, lastTradeTime } = await import('./lib/stocks.js');
 const { chartPng, chartSvg } = await import('./lib/chart.js');
@@ -97,14 +97,6 @@ if (check.tradeErrors.length) {
 
 // ── компоненты ─────────────────────────────────────────────────────────────
 const file = (f) => path.resolve(dir, f);
-const lock = new InstanceLock(file('data/instance.lock'));
-if (closeAll) {
-  if (!lock.tryAcquire().ok) {
-    console.error('Сначала остановите запущенный экземпляр бота, затем повторите --close-all из того же каталога данных.');
-    process.exit(1);
-  }
-  process.on('exit', () => lock.release());
-}
 const binance = new Binance(cfg);
 const notifier = new Notifier(cfg);
 // 📣 Telegram-каналы: платный и бесплатный
@@ -181,7 +173,6 @@ if (pauseTrading || resumeTrading) {
 const tradingInfo = () => ({
   wanted: tradeWanted, enabled: trader.enabled, configErrors: check.tradeErrors, hasKeys: trader.hasKeys(), mode: trader.mode, stocks: cfg.trade.stocks,
   ready: trader.ready, problem: trader.problem, userPause: trader.userPause(), paused: !!trader.state.paused,
-  entryBlock: trader.entryBlock(),
   open: trader.openTrades().length, maxPositions: cfg.trade.maxPositions, entry: cfg.trade.entry, balance: trader.balance?.equity ?? null,
 });
 const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version; } catch { return '?'; } })();
@@ -224,7 +215,7 @@ if (tradeCheck || tradeStatus || closeAll) {
   const up = trader.userPause();
   if (up) console.log(`⏸ Автоторговля на паузе с ${new Date(up.at).toLocaleString('ru-RU')} (${up.reason}) — снять: --resume-trading`);
   if (!trader.hasKeys()) { console.log('❌ Не заданы BYBIT_API_KEY и BYBIT_API_SECRET в .env'); process.exit(1); }
-  await trader.init({ readOnly: !closeAll });
+  await trader.init();
   if (!trader.ready) { console.log(`❌ ${trader.problem}`); process.exit(1); }
   const k = trader.keyInfo;
   if (tradeCheck) {
@@ -253,19 +244,8 @@ if (tradeCheck || tradeStatus || closeAll) {
     if (st.stats.n) console.log(`За 30 дней: ${nTrades(st.stats.n)}, прибыльных ${(st.stats.winRate * 100).toFixed(0)}%, итог ${fmtMoney(st.stats.pnl, { sign: true })}`);
   }
   if (closeAll) {
-    let incomplete = false;
     if (!trader.openTrades().length) console.log('Открытых сделок программы нет');
-    for (const t of await trader.closeAll()) {
-      incomplete ||= t.status !== 'closed';
-      const result = t.error ? `ошибка — ${t.error}` : t.status === 'closing'
-        ? 'закрытие ожидает подтверждения Bybit' : `закрыта, ${t.pnl != null ? fmtMoney(t.pnl, { sign: true }) : 'итог уточняется'}`;
-      console.log(`  ${coinOf(t.symbol)}: ${result}`);
-    }
-    if (trader.state.pendingEntry) {
-      incomplete = true;
-      console.error(trader.entryBlock());
-    }
-    if (incomplete) process.exit(1);
+    else for (const t of await trader.closeAll()) console.log(`  ${coinOf(t.symbol)}: ${t.error ? `ошибка — ${t.error}` : `закрыта, ${t.pnl != null ? fmtMoney(t.pnl, { sign: true }) : 'итог уточняется'}`}`);
   }
   process.exit(0);
 }
@@ -277,9 +257,8 @@ state = { ...state, ...(readJson(stateFile, {}) ?? {}) };
 // совместимость с версией 1.x: там состояние хранилось как { BTCUSDT: {action, at} }
 for (const [k, v] of Object.entries(state)) if (/USDT$/.test(k) && v?.action) { state.signals[k] = v; delete state[k]; }
 // журнал решений: почему сильный сигнал стал (или не стал) сделкой — в панели и командой --why
-const decisions = new Decisions(state.decisions, { flow: state.decisionFlow });
+const decisions = new Decisions(state.decisions);
 state.decisions = decisions.list;
-state.decisionFlow = decisions.flow;
 let saveTimer = null;
 function saveState() {
   if (saveTimer) return;
@@ -309,8 +288,7 @@ function breadthOf(kind) {
   const up = list.filter((r) => r.blocks.trend.score > 0.15).length, down = list.filter((r) => r.blocks.trend.score < -0.15).length;
   return { kind, n: list.length, up, down, value: (up - down) / list.length, avgScore: list.reduce((s, r) => s + r.score, 0) / list.length };
 }
-let lastCycleAt = 0, lastQuotesAt = 0, cycles = 0;
-let lastScan = { analyzed: 0, closed: 0, errors: 0 };
+let lastCycleAt = 0, cycles = 0;
 const startedAt = Date.now();
 
 // о чём писать на почту — EMAIL_EVENTS (по умолчанию: цена в зоне входа, сделки, киты, сбои); остальное — в панели
@@ -440,7 +418,6 @@ async function gatherStock(c, { light = false } = {}) {
   const live = flow.lastPrice(c.symbol);
   const lastTrade = Math.max(live?.time ?? 0, lastTradeTime(m15r) ?? 0);
   // разовый отчёт (--once) строится и при закрытых торгах — по последним свечам
-  if ((!m15.length || !h1.length) && (once || stockSessionOpen(cfg.stocks.hours))) throw new Error('Binance не вернул свечи акции');
   if (!m15.length || !h1.length || (!once && Date.now() - lastTrade > cfg.stocks.closedMinutes * 60e3)) {
     return { closed: true, symbol: c.symbol, lastTrade: lastTrade || null, price: live?.price ?? m15[m15.length - 1]?.close ?? null };
   }
@@ -482,7 +459,6 @@ async function gatherCrypto(c, { light = false } = {}) {
   candleCache.set(sym, h1);
   const lastBar = h1[h1.length - 1];
   if (!lastBar || Date.now() - lastBar.time > 2 * 3600e3) throw new Error(`данные Binance устарели (последняя свеча ${lastBar ? new Date(lastBar.time).toISOString().slice(0, 16) : '—'})`);
-  if (!(price > 0)) throw new Error('Binance не вернул цену');
   if (light) return { symbol: sym, name: c.name, price, candles: { m15, h1, h4, d1 }, market: market.snapshot(), macro: macroNow() };
 
   const H = h1.map((x) => x.high), L = h1.map((x) => x.low), C = h1.map((x) => x.close);
@@ -614,14 +590,8 @@ function noteExec(r) {
   if (!x) return;
   if (x.status === 'opened') {
     const t = x.trade;
-    trackDecision(r, 'opened');
     note(r.symbol, 'opened', `${t.side === 'Buy' ? 'лонг' : 'шорт'} на ${fmtMoney(t.notional)} по ${fmt(t.entry)}, стоп ${fmt(t.stop)}, цели ${fmt(t.t1)}${t.single ? '' : ` / ${fmt(t.t2)}`}`, { dir: r.action, merge: false });
-  } else note(r.symbol, x.status === 'error' ? 'error' : x.code === 'off' ? 'off' : 'skipped', x.reason, { dir: r.action, key: x.code ?? null });
-}
-
-function trackDecision(r, stage) {
-  r.decisionId = decisions.stage({ sym: r.symbol, dir: r.plan.dir, id: r.decisionId }, stage);
-  saveState();
+  } else note(r.symbol, x.code === 'off' ? 'off' : 'skipped', x.reason, { dir: r.action, key: x.code ?? null });
 }
 
 // сделка была бы, но автоторговля выключена — сказать об этом в письме и панели (если Bybit вообще настраивали)
@@ -646,9 +616,6 @@ async function handleResult(r, { zone = false } = {}) {
   const sym = r.symbol, now = Date.now();
   const st = state.signals[sym];
   const strong = r.action === 'BUY' || r.action === 'SELL';
-  const rangeMode = cfg.trade.range && !!r.range;
-  if (rangeMode && state.zones[sym]) dropZone(sym, 'обнаружен боковик, жду отбой от его границы');
-  if (r.setup || strong || (rangeMode ? r.range.plan : Math.abs(r.score) >= r.threshold)) trackDecision(r, 'candidate');
   const cooldown = cfg.signal.cooldownMinutes * 60e3;
 
   // подтверждение: сильный сигнал (в том числе тот, которому не хватает только хорошей цены — r.setup)
@@ -660,13 +627,12 @@ async function handleResult(r, { zone = false } = {}) {
     if (r.setup) {
       const count = p?.action === r.setup && recent ? p.count + 1 : 1;
       state.pending[sym] = { action: r.setup, count, at: now };
-      confirmed = r.rangeEntry || count >= cfg.signal.confirmPolls;
+      confirmed = count >= cfg.signal.confirmPolls;
     } else {
       if (recent && p.count < cfg.signal.confirmPolls) note(sym, 'unconfirmed', `сигнал ${ACT_RU[p.action]} продержался ${p.count} из ${cfg.signal.confirmPolls} проверок подряд`, { dir: p.action, key: 'unconfirmed' });
       delete state.pending[sym];
       // оценка дотянула до порога, но фильтр не пустил (мало подтверждений, против тренда, биткоин, новость, ФРС)
-      if (rangeMode && r.range.plan && r.warnings.length) note(sym, 'filtered', r.warnings[0], { dir: r.plan.dir });
-      else if (Math.abs(r.score) >= r.threshold && r.warnings.length) note(sym, 'filtered', `оценка ${sgn(r.score)} достаточна для ${r.score > 0 ? 'покупки' : 'продажи'}, но ${r.warnings[0]}`, { dir: r.plan.dir, key: reasonKey(r.warnings[0]) });
+      if (Math.abs(r.score) >= r.threshold && r.warnings.length) note(sym, 'filtered', `оценка ${sgn(r.score)} достаточна для ${r.score > 0 ? 'покупки' : 'продажи'}, но ${r.warnings[0]}`, { dir: r.plan.dir, key: reasonKey(r.warnings[0]) });
     }
     if (strong && !confirmed) { saveState(); return; }
   }
@@ -674,15 +640,17 @@ async function handleResult(r, { zone = false } = {}) {
   if (r.action === 'NEUTRAL') {
     if (st && st.action !== 'NEUTRAL') { state.signals[sym] = { action: 'NEUTRAL', at: now }; saveState(); }
     // картина выровнялась — зона больше не нужна
-    if (state.zones[sym] && Math.abs(r.score) < r.threshold * 0.3) dropZone(sym, `оценка ${sgn(r.score)} — картина выровнялась`);
+    // (у боковика оценка и так около нуля — его зона живёт, пока боковик не сломан)
+    if (state.zones[sym] && Math.abs(r.score) < r.threshold * 0.3 && !(isRangeZone(state.zones[sym]) && r.range?.ok)) dropZone(sym, `оценка ${sgn(r.score)} — картина выровнялась`);
+    if (isRangeZone(state.zones[sym]) && r.range?.broken) dropZone(sym, r.range.why);
     return;
   }
 
   if (strong) {
-    trackDecision(r, 'qualified');
     // разворот: подтверждён сигнал против открытой сделки — закрываем её сразу, не дожидаясь стопа
     // (сделка в новую сторону — отдельно, на ретесте уровня; при входе из зоны разворот делает сам trader.onSignal)
-    if (!zone && cfg.trade.exitOnReversal) {
+    // (сделка от границы боковика открытую сделку не закрывает — это не разворот тренда)
+    if (!zone && cfg.trade.exitOnReversal && !r.isRange) {
       const shut = await trader.exitOnSignal(sym, r.action);
       if (shut) {
         console.log(`🔄 Bybit: ${coinOf(sym)} — ${shut.side === 'Buy' ? 'лонг' : 'шорт'} закрыт по развороту: подтверждён сигнал ${ACT_RU[r.action]} (оценка ${sgn(r.score)})`);
@@ -701,10 +669,9 @@ async function handleResult(r, { zone = false } = {}) {
     // touch — цена в зоне входа; signal — сделка сразу по сигналу, где бы ни была цена
     const mode = cfg.trade.entry;
     const atLevel = priceInZone(zoneOf(r), r.price);
-    const inZone = r.rangeEntry || zone || (mode !== 'retest' && atLevel);
+    const inZone = zone || (mode !== 'retest' && atLevel);
     const tradeNow = mode === 'signal' || inZone;
     const tradeKind = r.kind !== 'stock' || cfg.trade.stocks; // акции — только при TRADE_STOCKS=1
-    if (tradeNow) trackDecision(r, 'entry');
     r.exec = !tradeNow ? null : trader.enabled && tradeKind ? await trader.onSignal(r, { zone }) : tradingOff(r);
     if (r.exec) console.log(`🤖 Bybit: ${r.exec.status === 'opened' ? `открыт ${r.exec.trade.side === 'Buy' ? 'лонг' : 'шорт'} ${coinOf(sym)} на ${fmtMoney(r.exec.trade.notional)}` : `без сделки — ${r.exec.reason}`}`);
     noteExec(r);
@@ -719,7 +686,7 @@ async function handleResult(r, { zone = false } = {}) {
       armZone(r, { setup: true, touched: retestOn(r.plan) && atLevel });
       note(sym, 'wait', waitText(r, atLevel), { dir: r.action, key: 'wait' });
       tgPost('paid', 'setup', TG.setupPost(r), { silent: true });
-    } else if (!r.rangeEntry && trader.enabled && RETRY_CODES.has(r.exec?.code)) keepForRetry(r, now);
+    } else if (trader.enabled && RETRY_CODES.has(r.exec?.code)) keepForRetry(r, now);
     else delete state.zones[sym];
     if (inZone && !r.exec) note(sym, 'signal', `${r.retest ? `ретест уровня ${levelTxt(r.retest.level)} удержался, цена ${fmt(r.price)}` : `цена ${fmt(r.price)} в зоне ${zoneTxt(r.plan)}`}${send ? ' — письмо отправлено' : ''}`, { dir: r.action, key: 'signal' });
 
@@ -759,14 +726,13 @@ async function handleResult(r, { zone = false } = {}) {
     if (r.setup && confirmed) note(sym, 'filtered', r.reason, { dir: base, key: 'no-room' });
     // идёт ретест уровня — его решит подтверждение по свежему анализу, а не план от другого уровня
     const zr = state.zones[sym];
-    if (zr && !(zr.touchedAt && retestOn(zr) && zr.dir === base)) dropZone(sym, 'даже от зоны входа прибыль/риск мал — хорошей точки входа нет');
+    if (zr && !(zr.touchedAt && retestOn(zr) && zr.dir === base) && !(isRangeZone(zr) && r.range?.ok)) dropZone(sym, 'даже от зоны входа прибыль/риск мал — хорошей точки входа нет');
     return;
   }
   // в эту сторону по монете уже действуем (сигнал только что был или сделка открыта) — новую зону не ждём
   if ((st?.action === base && st.notified !== false && now - st.at < cooldown) || hasTrade(sym, base)) return;
   const prev = state.zones[sym];
   const setup = !!r.setup && confirmed; // сильный подтверждённый сигнал, которому не хватает только хорошей цены
-  if (setup) trackDecision(r, 'qualified');
   armZone(r, { setup });
   const where = retestOn(r.plan) ? `ретест уровня ${levelTxt(r.plan.level)}` : `цену в зоне ${zoneTxt(r.plan)}`;
   if (setup && !(prev?.dir === base && prev.setup)) note(sym, 'wait', `сигнал ${ACT_RU[base]} подтверждён (оценка ${sgn(r.score)}), но от текущей цены ${fmt(r.price)} прибыль/риск мал — жду ${where}`, { dir: base, key: 'wait' });
@@ -802,12 +768,8 @@ function armZone(r, { setup = false, touched = false } = {}) {
   const same = prev?.dir === p.dir;
   // идёт ретест (цена у уровня): уровень и касание не меняются при каждом пересчёте — иначе подтверждение
   // откладывалось бы; ретест заканчивается подтверждением, провалом уровня, уходом цены, стопом или сроком
-  if (same && prev.touchedAt && prev.level && retestOn(prev)) {
-    prev.setup ||= setup;
-    prev.decisionId ??= r.decisionId;
-    return;
-  }
-  const level = p.level ? { low: p.level.low, high: p.level.high, role: p.level.role, brokeAt: p.level.brokeAt ?? null, volRatio: p.level.volRatio ?? null, sources: (p.level.sources ?? []).slice(0, 3) } : null;
+  if (same && prev.touchedAt && prev.level && retestOn(prev)) { prev.setup ||= setup; return; }
+  const level = p.level ? { low: p.level.low, high: p.level.high, role: p.level.role, brokeAt: p.level.brokeAt ?? null, volRatio: p.level.volRatio ?? null, sources: (p.level.sources ?? []).slice(0, 3), ...(p.level.box ? { box: p.level.box } : {}) } : null;
   // план обновился, а уровень тот же — касание и экстремум ретеста не теряются
   const keep = same && prev.touchedAt && level && prev.level && level.low <= prev.level.high && level.high >= prev.level.low;
   state.zones[r.symbol] = {
@@ -821,7 +783,6 @@ function armZone(r, { setup = false, touched = false } = {}) {
     until: same && prev.notifiedAt ? prev.until : r.kind === 'stock' ? stockZoneUntil(now, cfg.signal.zoneValidHours) : now + cfg.signal.zoneValidHours * 3600e3,
     lastTrigger: same ? prev.lastTrigger ?? 0 : 0, lastTriggerPrice: same ? prev.lastTriggerPrice ?? null : null,
     setup: setup || (same && !!prev.setup),
-    decisionId: (same ? prev.decisionId : null) ?? r.decisionId ?? null,
     ...(same && prev.notifiedAt ? { notifiedAt: prev.notifiedAt, lastCode: prev.lastCode, tries: prev.tries } : {}),
   };
 }
@@ -848,7 +809,6 @@ async function retryZoneTrade(r, z) {
   const sym = r.symbol;
   if (!trader.enabled || hasTrade(sym, r.action) || !RETRY_CODES.has(z.lastCode) || (z.tries ?? 0) >= MAX_TRIES) return;
   z.tries = (z.tries ?? 0) + 1;
-  trackDecision(r, 'entry');
   r.exec = await trader.onSignal(r, { zone: true });
   if (state.zones[sym] === z) z.lastCode = r.exec?.code ?? null;
   console.log(`🤖 Bybit, повторная попытка ${z.tries}: ${r.exec?.status === 'opened' ? `открыт ${r.exec.trade.side === 'Buy' ? 'лонг' : 'шорт'} ${coinOf(sym)} на ${fmtMoney(r.exec.trade.notional)}` : `без сделки — ${r.exec?.reason}`}`);
@@ -901,12 +861,6 @@ function macroAlerts() {
 
 // ── автоторговля: письма о сопровождении сделок ─────────────────────────────
 function onTradeEvent(ev) {
-  if (ev.type === 'entry-recovered' && !closeAll) {
-    const t = ev.trade;
-    const dir = t.side === 'Buy' ? 'BUY' : 'SELL';
-    decisions.stage({ sym: t.symbol, dir, id: t.decisionId }, 'opened');
-    note(t.symbol, 'opened', 'позиция восстановлена по исполненному входному ордеру Bybit', { dir, merge: false });
-  }
   const m = R.tradeEventMessage(ev, { pnlToday: trader.state.pnlToday, stats: trader.stats(30), balance: trader.balance });
   const send = wants(TRADE_EVENT_CATEGORY[ev.type] ?? 'trade');
   console.log(m.subject);
@@ -945,15 +899,14 @@ async function recent15(c) {
 async function zoneTrigger(sym, z) {
   const c = coins.find((x) => x.symbol === sym);
   if (!c) return;
+  if (isRangeZone(z) && (!cfg.range.enabled || cfg.range.autoOff)) { dropZone(sym, 'сделки от границ боковика выключены'); return; }
   const retest = retestOn(z);
   if (retest && !z.touchedAt) return; // при входе на ретесте проверка — только после касания уровня
   const b = await gather(c);
   if (b.closed) return; // торги по акции закрылись
   const r = analyze(b, cfg);
-  r.decisionId = z.decisionId;
   results.set(sym, r);
   if (state.zones[sym] !== z) return; // пока шёл анализ, зону сняли или заменили
-  if (cfg.trade.range && r.range) { dropZone(sym, 'обнаружен боковик, жду отбой от его границы'); return; }
   const rule = { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio };
   if (retest) {
     // уровень удержался? — последняя закрытая 15-минутная свеча; зона — та, которую ждали, стоп — за экстремумом ретеста
@@ -1107,7 +1060,7 @@ async function sendDigest() {
     results: list, market: market.snapshot(), journal: journal.recent(100), stats: journal.stats(30),
     liqMarket: streamsOn ? liq.marketSummary(1440) : null, whalesDay: streamsOn ? whalesDay : null, newsTop, health: health().text,
     events: calendar.upcoming(Date.now(), 7 * 24),
-    trading: trader.needsMonitoring() ? trader.status() : null,
+    trading: trader.enabled || trader.openTrades().length ? trader.status() : null,
     selftest: selfTest.status(),
   });
   logAlert(m.subject);
@@ -1124,12 +1077,12 @@ function digestDue() {
 function health() {
   const age = lastCycleAt ? (Date.now() - lastCycleAt) / 1000 : null;
   const limit = Math.max(cfg.pollSeconds * 5, 600);
-  const ok = scanHealthy({ startedAt, lastCycleAt, lastScan, maxAgeMs: limit * 1000 });
+  const ok = age == null ? Date.now() - startedAt < limit * 2000 : age < limit;
   const b = binance.status(), n = notifier.status();
-  const tr = trader.needsMonitoring() ? trader : null;
+  const tr = trader.enabled || trader.openTrades().length ? trader : null;
   const tradeText = tr ? `; Bybit (${MODE_RU[tr.mode]}): ${tr.ready ? `открыто ${tr.openTrades().length}, запросов ${tr.client.stats.requests}, ошибок ${tr.client.stats.errors}` : `не работает — ${tr.problem}`}` : '';
   const text = `циклов ${cycles}, последний ${age == null ? '—' : `${Math.round(age)} с назад`}; Binance: вес ${b.weight.spot}/6000 (спот), ${b.weight.futures}/2400 (фьючерсы), запросов ${b.requests}, ошибок ${b.errors}; писем ${n.emails}, SMS ${n.sms}, ошибок отправки ${n.errors}${tgOn ? `; Telegram: постов ${tg.stats.sent}, ошибок ${tg.stats.errors}${tg.stats.lost ? `, не отправлено ${tg.stats.lost} (${tg.stats.lastError})` : ''}` : ''}${tradeText}`;
-  return { ok, lastCycleSec: age == null ? null : Math.round(age), lastQuotesAt: lastQuotesAt || null, lastScan, cycles, text, binance: b, notifier: n, trading: tr ? { ready: tr.ready, open: tr.openTrades().length, problem: tr.problem, lastReconciledAt: tr.lastReconciledAt ?? null } : null, uptimeMin: Math.round((Date.now() - startedAt) / 60e3) };
+  return { ok, lastCycleSec: age == null ? null : Math.round(age), cycles, text, binance: b, notifier: n, trading: tr ? { ready: tr.ready, open: tr.openTrades().length, problem: tr.problem } : null, uptimeMin: Math.round((Date.now() - startedAt) / 60e3) };
 }
 
 const feedsSummary = () => {
@@ -1166,7 +1119,7 @@ const app = {
     liqBig: streamsOn ? liq.biggest(null, 10) : [],
     news: [...results.values()].flatMap((r) => r.news?.top ?? []).filter((n, i, a) => a.findIndex((x) => x.title === n.title) === i).sort((a, b) => b.time - a.time).slice(0, 12),
     whales4h: streamsOn ? Object.fromEntries(coins.map((c) => [c.symbol, flow.summary(c.symbol, 240)?.whales]).filter(([, w]) => w)) : {},
-    trading: trader.needsMonitoring() ? trader.status() : null,
+    trading: trader.enabled || trader.openTrades().length ? trader.status() : null,
     selftest: selfTest.status(),
     zones: zonesNow(),
     emailEvents: cfg.notify.events.map((x) => EMAIL_EVENT_NAMES[x] ?? x),
@@ -1175,7 +1128,6 @@ const app = {
     breadth: { ...breadth },
     options: Object.fromEntries(['BTC', 'ETH'].map((c) => [c, results.get(`${c}USDT`)?.options ?? null]).filter(([, v]) => v)),
     decisions: decisions.recent(40),
-    funnel: decisions.funnel(),
     stocks: {
       on: coins.some((c) => c.kind === 'stock'), source: stockInfo.source, missing: stockInfo.missing, index: stockIndex?.name ?? null, trade: cfg.trade.stocks,
       hours: SESSION_RU[cfg.stocks.hours] ?? cfg.stocks.hours, open: stockSessionOpen(cfg.stocks.hours), nextOpen: nextSessionOpen(cfg.stocks.hours), why: sessionReason(cfg.stocks.hours),
@@ -1190,6 +1142,13 @@ function applySelfTest({ notify = false } = {}) {
   const v = cfg.selftest.enabled ? selfTest.verdict() : null; // SELF_TEST=0 — старый итог на риск не влияет
   const bad = v?.level === 'bad';
   trader.extraRisk = bad && cfg.selftest.guard ? { mult: v.mult, note: `риск ×${v.mult}: самопроверка на истории в минусе` } : null;
+  // сделки от границ боковика в минусе на истории — не открываем их до следующей проверки
+  const rv = v && cfg.selftest.guard ? rangeVerdict(selfTest.result) : null;
+  const rangeOff = !!rv?.off;
+  if (rangeOff !== !!cfg.range.autoOff) {
+    cfg.range.autoOff = rangeOff;
+    if (cfg.range.enabled) console.log(rangeOff ? `🧪 Сделки от границ боковика на истории в минусе (${rv.n} сделок, в среднем ${rv.avgR.toFixed(2)}R) — выключены до следующей самопроверки` : '🧪 Сделки от границ боковика снова включены');
+  }
   if (!notify || !v) return;
   const prev = state.selfTestLevel ?? null;
   state.selfTestLevel = v.level;
@@ -1280,6 +1239,7 @@ if (tgTest) {
 
 // ── запуск ─────────────────────────────────────────────────────────────────
 let running = true;
+const lock = new InstanceLock(file('data/instance.lock'));
 function saveAll() {
   try { writeJsonAtomic(stateFile, state, { pretty: true }); } catch { /* ignore */ }
   try { journal.save(); } catch { /* ignore */ }
@@ -1320,7 +1280,6 @@ if (!once) {
     await sleep(15e3);
     res = lock.tryAcquire();
   }
-  trader.reload();
 }
 
 if (!BinanceStream.supported() && cfg.whales.enabled && !once) console.error('⚠️ Для китов, ликвидаций и живых зон нужен Node.js 22+ (WebSocket) — эти функции отключены');
@@ -1328,7 +1287,7 @@ if (!BinanceStream.supported() && cfg.whales.enabled && !once) console.error('�
 const clockSkew = once ? null : await binance.serverTimeSkew().catch(() => null);
 if (clockSkew != null && Math.abs(clockSkew) > 5e3) console.error(`⚠️ Часы сервера расходятся с Binance на ${(clockSkew / 1000).toFixed(1)} с — включите синхронизацию времени: timedatectl set-ntp true`);
 await market.refresh();
-const tradingOn = !once && trader.needsMonitoring();
+const tradingOn = !once && (trader.enabled || trader.openTrades().length > 0);
 const critical = (subject, text) => {
   logAlert(subject, wants('critical'));
   if (wants('critical')) notifier.enqueue({ subject, tag: '⚠️', text, html: `<p><b>${escapeHtml(subject)}</b></p><p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>` });
@@ -1347,19 +1306,6 @@ if (tradingOn) {
   }
   if (!trader.ready) critical('⚠️ Crypto Watcher: автоторговля на Bybit не запустилась', `${trader.describe()}\n\nПроверьте ключ командой node index.js --trade-check. Сигналы и киты работают как обычно; программа будет пробовать подключиться снова каждые 10 минут.`);
 }
-if (!once) {
-  const range = cfg.trade.range ? 'включена (TRADE_RANGE=1)' : 'выключена (TRADE_RANGE=0)';
-  const connection = tradingOn ? (trader.ready ? 'подключён' : 'ошибка подключения') : 'проверка не запускалась';
-  const pause = trader.userPause();
-  const dailyPause = trader.state.paused && trader.state.day === new Date().toLocaleDateString('sv-SE');
-  let entries = 'разрешены, жду сигнал';
-  if (!trader.enabled) entries = 'автоторговля выключена';
-  else if (!trader.ready) entries = 'жду подключения к Bybit';
-  else if (pause) entries = 'ручная пауза';
-  else if (dailyPause) entries = 'достигнут дневной лимит убытка';
-  else entries = trader.entryBlock() ?? entries;
-  console.log(`🤖 Старт торговли | Боковик: ${range} | Режим: ${trader.mode} | Bybit: ${connection} | Новые входы: ${entries}`);
-}
 await refreshUniverse(true);
 if (!once) {
   applySelfTest(); // итог прошлой самопроверки: если стратегия на истории в минусе — риск сделок вдвое меньше
@@ -1372,9 +1318,7 @@ if (!once) {
   }, 60e3).unref();
   startServer(cfg, app);
   setInterval(liveTick, 5000).unref();
-  if (tradingOn) setInterval(() => {
-    if (running) trader.tick().catch((e) => console.error('Bybit:', e.message));
-  }, cfg.trade.tickSeconds * 1000).unref();
+  if (tradingOn) setInterval(() => { trader.tick().catch((e) => console.error('Bybit:', e.message)); }, cfg.trade.tickSeconds * 1000).unref();
   // сторож: если анализ завис (нет завершённых циклов слишком долго) — выходим, Docker/systemd перезапустят
   setInterval(() => {
     const since = Date.now() - (lastCycleAt || startedAt);
@@ -1407,17 +1351,13 @@ do {
       if (!b.closed) results.set(`${stockIndex.symbol}@ctx`, analyze(b, cfg));
     } catch { /* фон не обязателен */ }
   }
-  const scan = { analyzed: 0, closed: 0, errors: 0 };
   for (const c of ordered) {
     if (!running) break;
     try {
       const b = await gather(c);
-      if (b.closed) { scan.closed++; marketClosed(c, b); errors.set(c.symbol, 0); await sleep(150); continue; }
-      if (b.price > 0) lastQuotesAt = Date.now();
+      if (b.closed) { marketClosed(c, b); errors.set(c.symbol, 0); await sleep(150); continue; }
       if (closedNow.delete(c.symbol)) console.log(`🔔 ${coinOf(c.symbol)}: торги по акции открылись`);
       const r = analyze(b, cfg);
-      const invalid = resultProblem(r);
-      if (invalid) throw new Error(`результат анализа отклонён: ${invalid}`);
       if (/^BTC/.test(c.symbol) && c.kind !== 'stock') market.setBtc(r);
       if (once) console.log(`\n${R.signalText(r)}\n`);
       else {
@@ -1426,9 +1366,8 @@ do {
       }
       await handleResult(r);
       newsAlerts(r);
-      scan.analyzed++;
       errors.set(c.symbol, 0);
-    } catch (e) { scan.errors++; onError(c.symbol, e); }
+    } catch (e) { onError(c.symbol, e); }
     await sleep(150);
   }
   journalFallback();
@@ -1437,7 +1376,6 @@ do {
   breadth.crypto = breadthOf('crypto');
   breadth.stock = breadthOf('stock');
   lastCycleAt = Date.now();
-  lastScan = scan;
   cycles++;
   // короткий отчёт о работе — для команды --why (видно, что программа жива и с какими настройками работает)
   if (!once) { state.status = { at: lastCycleAt, version: VERSION, startedAt, cycles, coins: coins.length, confirmPolls: cfg.signal.confirmPolls, trading: tradingInfo(), stocks: stocksStatus() }; saveState(); }
