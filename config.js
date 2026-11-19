@@ -192,6 +192,9 @@ export default {
     cooldownHours: num(env.TRADE_COOLDOWN_HOURS, 6),       // после убытка по монете — столько часов по ней не входить
     beAtR: num(env.TRADE_BE_AT_R, 1),                      // прибыль в столько рисков — стоп в безубыток (ещё до цели 1)
     volRiskMult: num(env.TRADE_VOL_RISK_MULT, 0.5),        // множитель риска при высокой волатильности рынка
+    // надёжный стоп: strong — для сильных сигналов стоп за следующей опорой (позиция меньше, риск в $ тот же),
+    // all — для всех сигналов, off — всегда стоп сразу за уровнем входа
+    wideStop: (clean(env.TRADE_WIDE_STOP) || 'strong').toLowerCase(),
     exitOnReversal: bool(env.TRADE_EXIT_ON_REVERSAL, true), // подтверждённый сигнал против открытой сделки — закрыть её, не дожидаясь стопа
     maxSpreadPct: num(env.TRADE_MAX_SPREAD, 0.15),         // разница цен покупки и продажи на Bybit больше — не входить (0 — не проверять)
     stocks: bool(env.TRADE_STOCKS, false),            // открывать сделки и по акциям (фьючерсы на акции Bybit) — по умолчанию нет

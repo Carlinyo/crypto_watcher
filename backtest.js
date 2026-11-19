@@ -27,7 +27,7 @@ const { Binance } = await import('./lib/binance.js');
 const { analyze, decide } = await import('./lib/analyzer.js');
 const { fmt } = await import('./lib/format.js');
 const { priceInZone, zoneEntry } = await import('./lib/policy.js');
-const { touches, isConfirmation, retestPlan, freshPlanFor, entryCheck, isRangeZone } = await import('./lib/entry.js');
+const { touches, isConfirmation, retestPlan, freshPlanFor, entryCheck, isRangeZone, finalStop } = await import('./lib/entry.js');
 const { STOCK_CANDIDATES, tradedOnly } = await import('./lib/stocks.js');
 const { simulateAccount, accountText } = await import('./lib/portfolio.js');
 const os = await import('node:os');
@@ -122,7 +122,7 @@ function analyzeAt(sym, data, i, price, btcAt) {
   return analyze(bundle, acfg);
 }
 
-const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.isRange ? r.planTrend ?? r.plan : r.plan, planLegacy: r.planLegacy, core: r.core, range: r.range, trend: r.blocks.trend.score, atr: r.stats.atr });
+const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: r.completeness, regime: r.regime, plan: r.isRange ? r.planTrend ?? r.plan : r.plan, planLegacy: r.planLegacy, core: r.core, range: r.range, trend: r.blocks.trend.score, atr: r.stats.atr, levels: { supports: r.levels.supports, resistances: r.levels.resistances } });
 
 // ── симуляция сделок по сохранённым оценкам ───────────────────────────────
 // Способы входа (--entry, как TRADE_ENTRY; --compare — все три на одних данных):
@@ -135,9 +135,10 @@ const compact = (r) => ({ score: r.score, agreement: r.agreement, completeness: 
 // Вход по свежему анализу — если оценка в ту же сторону не слабее 70% порога, прибыль/риск от MIN_RR и нет запретов.
 function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
   // norange — вход на ретесте без сделок в боковике (для сравнения: что дают сделки от границ боковика)
-  const noRange = mode === 'norange';
-  if (noRange) mode = 'retest';
-  const c = { ...cfg, signal: { ...cfg.signal, threshold: thr }, trade: { ...cfg.trade, entry: mode }, range: { ...cfg.range, enabled: cfg.range.enabled && !noRange } };
+  // tightstop — вход на ретесте со стопом сразу за уровнем у всех сигналов (как до 3.4)
+  const noRange = mode === 'norange', tight = mode === 'tightstop';
+  if (noRange || tight) mode = 'retest';
+  const c = { ...cfg, signal: { ...cfg.signal, threshold: thr }, trade: { ...cfg.trade, entry: mode, ...(tight ? { wideStop: 'off' } : {}) }, range: { ...cfg.range, enabled: cfg.range.enabled && !noRange } };
   const legacy = mode !== 'retest';
   const planOf = (x) => (legacy ? x.planLegacy ?? x.plan : x.plan);
   const feePct = (cfg.risk.feePct ?? 0.2) / 100;
@@ -225,7 +226,10 @@ function simulate(sym, data, recs, thr, zoneCache, mode = entryMode) {
           const plan = retestPlan(base, zone, { price: px, ext: zone.ext, atr: rz.atr, stopMult: rz.regime.stopMult ?? 1, risk: cfg.risk });
           const res = entryCheck(zone, { score: rz.score, threshold: d.threshold, vetoes: d.vetoes, rangeVetoes: d.rangeVetoes }, plan, rule);
           if (res.ok) {
-            openTrade(j, zone.dir, px, plan, { breakout: 'ретест', range: 'боковик' }[L.role] ?? 'отскок', rz);
+            // сильный сигнал — стоп за следующей опорой (TRADE_WIDE_STOP); свечи — только закрытые до входа
+            const fin = finalStop(zone, { score: rz.score, confidence: d.confidence, stats: { atr: rz.atr }, regime: rz.regime, levels: rz.levels, price: px }, plan,
+              { h1: data.h1.slice(Math.max(0, j - 24), j), minRR: rule.minRR, risk: cfg.risk, wideStop: c.trade.wideStop, strong: cfg.signal.strong });
+            openTrade(j, zone.dir, px, fin.plan, { breakout: 'ретест', range: 'боковик' }[L.role] ?? 'отскок', rz);
             lastSig = j;
             zone = null;
             // остаток часа после входа — только стоп (консервативно)
@@ -313,7 +317,7 @@ const REG_RU = { trend_up: 'восх. тренд', trend_down: 'нисх. тре
 say(`Бэктест: ${symbols.join(', ')} | ${days} дн. | анализ каждые ${step} ч | порог ${baseThr} | вход ${compare ? 'всеми тремя способами' : ENTRY_MODES[entryMode]}${fast ? ' | без 15m (подтверждение ретеста — по часовым свечам)' : ''}`);
 say('Загрузка истории (кэшируется в data/history)…');
 const thresholds = grid ? [0.25, 0.28, 0.3, 0.33, 0.36, 0.4, 0.45, 0.5] : [baseThr];
-const CMP = [['retest', 'ретест'], ['touch', 'касание 2.7'], ['signal', 'по сигналу'], ['norange', 'без боковика']];
+const CMP = [['retest', 'ретест'], ['touch', 'касание 2.7'], ['signal', 'по сигналу'], ['norange', 'без боковика'], ['tightstop', 'стоп у уровня']];
 const runs = new Map(thresholds.map((thr) => [thr, []]));   // порог → сделки (способ входа — entryMode)
 const cmpRuns = new Map(CMP.map(([m]) => [m, []]));         // способ входа → сделки при основном пороге
 const perSym = [];                                            // [монета, сделки] при основном пороге

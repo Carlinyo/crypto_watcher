@@ -920,7 +920,7 @@ async function zoneTrigger(sym, z) {
   const r = analyze(b, cfg);
   results.set(sym, r);
   if (state.zones[sym] !== z) return; // пока шёл анализ, зону сняли или заменили
-  const rule = { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio };
+  const rule = { minRR: cfg.signal.minRiskReward, triggerRatio: cfg.signal.zoneTriggerRatio, wideStop: cfg.trade.wideStop, strong: cfg.signal.strong };
   if (retest) {
     // уровень удержался? — последняя закрытая 15-минутная свеча; зона — та, которую ждали, стоп — за экстремумом ретеста
     const m15 = await recent15(c).catch(() => b.candles.m15);
